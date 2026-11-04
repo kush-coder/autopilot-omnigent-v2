@@ -1,0 +1,87 @@
+"""Models and provenance metadata shared by session import layers."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal
+
+from omnigent.entities import MessageData, NewConversationItem
+from omnigent.entities.conversation import synthesize_conversation_title
+
+ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
+
+# Upper bound on items in one imported session. The import API rejects a larger
+# session; the Codex loader may first trim it to its last compaction.
+MAX_IMPORT_ITEMS = 100_000
+
+
+def import_item_payload(item: NewConversationItem) -> dict[str, object]:
+    """Serialize one imported item as the import API and host frames carry it."""
+    return {
+        "type": item.type,
+        "response_id": item.response_id,
+        "data": item.data.model_dump(mode="json", exclude_none=True),
+    }
+
+
+def from_last_compaction(
+    items: Sequence[NewConversationItem],
+) -> tuple[NewConversationItem, ...] | None:
+    """The last compaction item and everything after it, or ``None`` if that drops nothing.
+
+    This is the context a cold resume rebuilds from, so a session too large to import
+    whole falls back to it.
+    """
+    for index in range(len(items) - 1, 0, -1):
+        if items[index].type == "compaction":
+            return tuple(items[index:])
+    return None
+
+
+IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source"
+IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY = "omnigent.import.external_session_id"
+IMPORT_PROVENANCE_LABEL_KEYS = frozenset(
+    {
+        IMPORT_SOURCE_LABEL_KEY,
+        IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
+    }
+)
+
+
+class SessionImportNotFoundError(FileNotFoundError):
+    """Raised when a requested local harness session cannot be found."""
+
+
+@dataclass(frozen=True)
+class LocalSessionImport:
+    """One local transcript normalized for the import API."""
+
+    source: ImportSource
+    external_session_id: str
+    workspace: str | None
+    items: tuple[NewConversationItem, ...]
+    # The harness's own session title (Claude's custom/ai title, Codex's thread
+    # title) when the transcript carried one; None to fall back to the first
+    # user message.
+    native_title: str | None = None
+    # Whether the harness had archived the session (Codex ``threads.archived`` or
+    # an ``archived_sessions/`` rollout); the import lands archived in Omnigent too.
+    archived: bool = False
+
+    @property
+    def title(self) -> str | None:
+        """Prefer the harness's own title, else derive from the first user message."""
+        return self.native_title or title_from_items(self.items)
+
+
+def title_from_items(items: Sequence[NewConversationItem]) -> str | None:
+    """Return a sidebar title derived from the first user message."""
+    for item in items:
+        if (
+            isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and not item.data.is_meta
+        ):
+            return synthesize_conversation_title(item.data.content)
+    return None

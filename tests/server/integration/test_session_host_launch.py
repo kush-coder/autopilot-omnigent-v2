@@ -1,0 +1,5156 @@
+"""Integration tests for the inline host-launch path of ``POST /v1/sessions``.
+
+This is the path the Web UI's New Chat wizard actually hits: the
+browser picks a host + workspace + agent and POSTs them to
+``/v1/sessions`` in one call, and the server validates the workspace
+against the host (``host.stat``), atomically binds a runner, and
+sends a ``host.launch_runner`` frame.
+
+The dedicated ``POST /v1/hosts/{id}/runners`` endpoint is covered by
+``test_hosts_api.py``. These tests pin the *inline* path's distinct
+behavior — in particular its deliberately lenient failure handling:
+unlike the dedicated endpoint (which raises 502/504 when the host
+declines or times out), session-create still returns 201 with the
+runner bound, leaving the session recoverable via reconnect/relaunch.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import subprocess
+import threading
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+from asgiref.testing import ApplicationCommunicator
+from fastapi import FastAPI
+
+from omnigent.cli_invocation import cli_invocation
+from omnigent.entities import Conversation
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.host.connect import HostProcess
+from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
+    HostHelloFrame,
+    HostLaunchRunnerFrame,
+    HostLaunchRunnerResultFrame,
+    HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
+    HostStatFrame,
+    HostStatResultFrame,
+    HostStopRunnerFrame,
+    HostStopRunnerResultFrame,
+    decode_host_frame,
+    encode_host_frame,
+)
+from omnigent.host.identity import HostIdentity
+from omnigent.runner.identity import token_bound_runner_id
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.scheduled_context import scheduled_run_scope
+from omnigent.server.app import create_app
+from omnigent.server.host_registry import HostConnection
+from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
+    resolve_launch_timeout_s,
+)
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
+from tests.budgets import Deadline, budget
+from tests.server.helpers import create_test_agent
+from tests.server.helpers import websocket_scope as _websocket_scope
+
+pytestmark = pytest.mark.asyncio
+
+_HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
+_WORKSPACE = "/work/repo"
+_RUNNER_NOT_AVAILABLE = (
+    "The runner for this session is not available — it may have failed to start. "
+    "See the host logs."
+)
+
+
+def _host_offline_message() -> str:
+    """Return the failure text a send gets when its session's host is offline.
+
+    Built from ``cli_invocation()`` so hosts that wrap the CLI (``isaac omni``)
+    see the same spelling the server renders.
+    """
+    return (
+        "The host for this session is offline. "
+        f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+    )
+
+
+class _NoopRunnerWS:
+    """Minimal runner WebSocket fake for registering a tunnel session."""
+
+    async def send_text(self, data: str) -> None:
+        """Accept outbound tunnel frames without sending them anywhere."""
+        del data
+
+    async def receive_text(self) -> str:
+        """Block forever; tests do not drive runner inbound frames."""
+        return await asyncio.Future()
+
+
+def _runner_hello() -> HelloFrame:
+    """Build a runner hello frame for test tunnel registrations.
+
+    :returns: Hello frame with generic native harness capabilities.
+    """
+    return HelloFrame(
+        runner_version="0.1.0-test",
+        frame_protocol_version=1,
+        harnesses=[
+            "claude-native",
+            "claude-sdk",
+            "codex",
+            "codex-native",
+            "openai-agents",
+        ],
+        envs=[],
+    )
+
+
+@pytest.fixture()
+def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+    """FastAPI app wired WITH ``host_store`` so the inline host-launch
+    branch of ``POST /v1/sessions`` is active.
+
+    Overrides the ``app`` fixture from ``tests/server/conftest.py``
+    (which passes ``host_store=None`` and therefore skips the launch
+    branch). The shared ``client`` fixture depends on this ``app`` and
+    so resolves to this override for tests in this module.
+
+    :param runtime_init: Initializes the runtime + mock LLM.
+    :param db_uri: SQLite database URI.
+    :param tmp_path: Pytest temp dir for artifacts and cache.
+    :returns: A configured FastAPI app with host routes mounted.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+    )
+
+
+async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+    """Connect a mock host over the WebSocket tunnel and wait for it
+    to register in the app's host registry.
+
+    :param app: The FastAPI app under test (its ``state.host_registry``
+        is the same instance the session-create launch path reads).
+    :returns: The connected ASGI communicator, ready to exchange frames.
+    """
+    path = f"/v1/hosts/{_HOST_ID}/tunnel"
+    comm = ApplicationCommunicator(app, _websocket_scope(path))
+    await comm.send_input({"type": "websocket.connect"})
+    accepted = await comm.receive_output(timeout=budget(1.0))
+    assert accepted["type"] == "websocket.accept"
+
+    hello = encode_host_frame(
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    )
+    await comm.send_input({"type": "websocket.receive", "text": hello})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is None:
+        await asyncio.sleep(0.01)
+    return comm
+
+
+async def _wait_for_runner_connect_waiter(
+    app: FastAPI,
+    runner_id: str,
+) -> None:
+    """Wait until the app registry has a connect waiter for a runner.
+
+    The wait is a scaled ``budget`` hang guard: a loaded ``-n 4`` CI worker
+    can take over a second to route the POST to its connect grace wait.
+
+    :param app: FastAPI app whose ``state.tunnel_registry`` is under
+        test.
+    :param runner_id: Runner id expected to have one waiter, e.g.
+        ``"runner_token_abc123"``.
+    :returns: None.
+    :raises AssertionError: If no waiter appears before the budget expires.
+    """
+    deadline = time.monotonic() + budget(5.0)
+    while time.monotonic() < deadline:
+        if app.state.tunnel_registry.connect_waiter_count(runner_id) > 0:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"runner {runner_id!r} did not get a connect waiter")
+
+
+async def _serve_one_launch(
+    comm: ApplicationCommunicator,
+    *,
+    launch_status: str,
+    launch_error: str | None = None,
+    launch_error_code: str | None = None,
+    workspace_recreated: bool = False,
+) -> HostLaunchRunnerFrame:
+    """Answer the host round-trips for a single inline session launch.
+
+    The inline path performs two sequential host round-trips within
+    the one ``POST /v1/sessions`` call: a ``host.stat`` to validate
+    the workspace, then a ``host.launch_runner``. This reads the
+    host's outbound frames, replies "exists/directory" to the stat
+    (echoing the requested path as the canonical path) and replies
+    with ``launch_status`` to the launch, then returns.
+
+    :param comm: The connected host communicator.
+    :param launch_status: ``"launched"`` or ``"failed"`` — the status
+        the fake host reports for the launch.
+    :param launch_error: Error string to attach when the launch is
+        reported as failed.
+    :param launch_error_code: Structured failure category to attach,
+        e.g. ``"harness_not_configured"``; ``None`` reports an
+        uncategorized failure (legacy host behavior).
+    :param workspace_recreated: Report that the host recreated a deleted
+        workspace before spawning. Added as the raw wire key so the test
+        exercises the server's decoding of an upgraded host's payload.
+    :returns: The ``host.launch_runner`` frame the server sent, so
+        callers can assert on its fields (e.g. ``harness``).
+    """
+    # Bounded so a routing bug can't hang the test: stat + launch are
+    # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
+    # for the whole exchange — a per-receive budget would multiply by 40.
+    deadline = Deadline(30.0)
+    for _ in range(40):
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=True,
+                            type="directory",
+                            canonical_path=frame.path,
+                        )
+                    ),
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            result_text = encode_host_frame(
+                HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status=launch_status,
+                    runner_id="runner_from_host" if launch_status == "launched" else None,
+                    error=launch_error,
+                    error_code=launch_error_code,
+                )
+            )
+            if workspace_recreated:
+                result_text = json.dumps({**json.loads(result_text), "workspace_recreated": True})
+            await comm.send_input({"type": "websocket.receive", "text": result_text})
+            return frame
+    raise AssertionError("host never received a launch frame from the inline path")
+
+
+async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
+    """Answer the host's ``host.stop_runner`` round-trip for one Stop.
+
+    Reads the host's outbound frames until a
+    :class:`HostStopRunnerFrame` arrives (skipping interleaved pings),
+    replies ``stopped`` so the server's pending-stop future resolves,
+    and returns the ``runner_id`` the server asked the host to stop.
+
+    :param comm: The connected host communicator.
+    :returns: The ``runner_id`` carried by the stop frame, e.g.
+        ``"runner_token_abc123..."``.
+    :raises AssertionError: If no stop frame arrives within the frame
+        budget — i.e. the Stop handler did not ask the host to stop the
+        runner (the regression this guards against).
+    """
+    # Bounded so a missing stop frame fails fast instead of hanging.
+    deadline = Deadline(20.0)
+    for _ in range(40):
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStopRunnerFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStopRunnerResultFrame(
+                            request_id=frame.request_id,
+                            status="stopped",
+                        )
+                    ),
+                }
+            )
+            return frame.runner_id
+    raise AssertionError("host never received a stop_runner frame from the stop path")
+
+
+async def _expect_no_launch(comm: ApplicationCommunicator, *, budget_s: float) -> bool:
+    """Watch host outbound frames for a launch frame within a budget.
+
+    Reads the host's outbound frames (skipping interleaved pings) until
+    either a :class:`HostLaunchRunnerFrame` arrives or the receive blocks
+    longer than *budget_s* with nothing more to read.
+
+    :param comm: Connected host communicator.
+    :param budget_s: Seconds to wait on each receive before concluding no
+        further frames are coming, e.g. ``2.0``.
+    :returns: ``True`` if a launch frame was observed (a relaunch was
+        attempted), ``False`` if none arrived within the budget (the
+        expected outcome for a deliberately stopped session).
+    """
+    try:
+        # Bounded so a chatty ping loop can't spin forever.
+        for _ in range(40):
+            output = await comm.receive_output(timeout=budget_s)
+            if output["type"] != "websocket.send":
+                continue
+            if isinstance(decode_host_frame(output["text"]), HostLaunchRunnerFrame):
+                return True
+    except TimeoutError:
+        return False
+    return False
+
+
+async def _wait_for_launch(
+    comm: ApplicationCommunicator, *, budget_s: float
+) -> HostLaunchRunnerFrame | None:
+    """Watch host outbound frames and return the first launch frame seen.
+
+    The positive counterpart to :func:`_expect_no_launch`: reads the
+    host's outbound frames (skipping interleaved pings) and returns the
+    :class:`HostLaunchRunnerFrame` if one arrives within *budget_s*, or
+    ``None`` if none does within the budget.
+
+    :param comm: Connected host communicator.
+    :param budget_s: Seconds to wait on each receive before concluding no
+        launch is coming, e.g. ``5.0``.
+    :returns: The launch frame the host received, or ``None``.
+    """
+    try:
+        # Bounded so a chatty ping loop can't spin forever.
+        for _ in range(40):
+            output = await comm.receive_output(timeout=budget_s)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                return frame
+    except TimeoutError:
+        return None
+    return None
+
+
+async def _answer_runner_status_then_wait_for_launch(
+    comm: ApplicationCommunicator,
+    *,
+    status: str,
+    budget_s: float,
+) -> HostLaunchRunnerFrame | None:
+    """Reply to a ``host.runner_status`` query, then return the launch frame.
+
+    Models the host-owned liveness race: reads the host's outbound frames
+    (skipping interleaved pings), answers the first
+    :class:`HostRunnerStatusFrame` with *status* so the dispatch gate's
+    query resolves, and then returns the first
+    :class:`HostLaunchRunnerFrame` the relaunch sends. Used to prove that a
+    ``dead``/``unknown`` verdict cuts the connect grace short — the launch
+    arrives well inside *budget_s* even though the grace is much longer.
+
+    :param comm: Connected host communicator.
+    :param status: Verdict to answer the query with (``"alive"`` /
+        ``"dead"`` / ``"unknown"``).
+    :param budget_s: Seconds to wait on each receive, e.g. ``2.0``.
+    :returns: The launch frame the relaunch sent, or ``None`` if none
+        arrived within the budget.
+    """
+    answered = False
+    try:
+        for _ in range(40):
+            output = await comm.receive_output(timeout=budget_s)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostRunnerStatusFrame) and not answered:
+                answered = True
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRunnerStatusResultFrame(
+                                request_id=frame.request_id,
+                                status=status,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return frame
+    except TimeoutError:
+        return None
+    return None
+
+
+async def test_inline_launch_binds_runner_and_returns_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """Happy path: ``POST /v1/sessions`` with ``host_id`` + ``workspace``
+    validates the workspace, binds a runner, launches it, and returns
+    the binding.
+
+    A failure here means the Web UI New Chat wizard's create call no
+    longer launches a runner — the user would get an unbound session.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    # The response must carry the binding so the UI can route to the
+    # runner; a None here means the launch branch didn't run.
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"] is not None
+    # runner_id is derived from the server's binding token, NOT the
+    # runner_id the host echoed back — so it has the token prefix.
+    assert body["runner_id"].startswith("runner_token_"), (
+        f"runner_id should be derived from the server binding token, got {body['runner_id']!r}"
+    )
+    # Canonical workspace from host.stat is what gets stored/returned.
+    assert body["workspace"] == _WORKSPACE
+
+    # The conversation row must reflect the same binding, proving the
+    # atomic set_runner_id + host_id/workspace writes persisted.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.runner_id == body["runner_id"]
+    assert conv.host_id == _HOST_ID
+    assert conv.workspace == _WORKSPACE
+
+
+async def test_inline_launch_stamps_terminal_view_label_at_creation(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A host-launched SDK session carries ``omnigent.ui: terminal`` in
+    the create response itself.
+
+    The runner stamps this label only *after* auto-creating its REPL
+    terminal, which is too late for the Web UI's "Starting up…"
+    indicator: that needs the label while the terminal is still missing,
+    so the window was empty by construction and these sessions fell back
+    to the passive "Connecting…" row under the composer. Asserting on the
+    create response (not a later snapshot) is the whole point — a
+    regression that defers the stamp restores the wrong spinner.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["labels"].get("omnigent.ui") == "terminal", (
+        f"create response must carry the terminal-view label; got {body['labels']}"
+    )
+    # The stamp merges over caller labels rather than replacing them.
+    assert body["labels"].get("env") == "test"
+    # Persisted, not just echoed — the snapshot a reloading UI reads is the row.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels.get("omnigent.ui") == "terminal"
+
+
+@pytest.mark.parametrize("harness", ["pi-native", "native-pi", "claude-native", "codex-native"])
+async def test_inline_launch_stamps_terminal_view_label_for_custom_native_harness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """Custom native agents expose their terminal at creation and after reload."""
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        name="custom-native-agent",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    expected_labels = {"env": "test", "omnigent.ui": "terminal", "omnigent.client_surface": "cli"}
+    assert body["labels"] == expected_labels
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels == expected_labels
+
+    listed = await client.get("/v1/sessions")
+    assert listed.status_code == 200
+    row = next(row for row in listed.json()["data"] if row["id"] == body["id"])
+    assert row["labels"] == expected_labels
+
+    # Existing sessions can predate the creation-time label.
+    store.delete_label(body["id"], "omnigent.ui")
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["labels"] == expected_labels
+
+
+@pytest.mark.parametrize(
+    "spec_harness,harness_override,terminal_view",
+    [
+        ("claude-sdk", "pi-native", True),
+        ("pi-native", "claude-sdk", False),
+        ("pi-native", "auto", False),
+    ],
+)
+async def test_custom_native_terminal_view_uses_harness_override(
+    client: httpx.AsyncClient,
+    spec_harness: str,
+    harness_override: str,
+    terminal_view: bool,
+) -> None:
+    """Only the effective native harness grants terminal access without a host."""
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": spec_harness}},
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness_override},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert (body["labels"].get("omnigent.ui") == "terminal") is terminal_view
+    assert "omnigent.wrapper" not in body["labels"]
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert (snapshot.json()["labels"].get("omnigent.ui") == "terminal") is terminal_view
+
+
+async def test_native_subagent_mirror_does_not_gain_terminal_view(
+    client: httpx.AsyncClient,
+) -> None:
+    """A native thread mirror inherits a harness but has no terminal of its own."""
+    agent = await create_test_agent(
+        client,
+        name="custom-native-parent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    response = await client.post(
+        f"/v1/sessions/{agent['_session_id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "terminal-view-mirror",
+                "agent_type": "worker",
+                "description": "Check terminal visibility",
+                "tool_use_id": "toolu_terminal_view_mirror",
+            },
+        },
+    )
+    assert response.status_code in (200, 202), response.text
+    child_id = response.json()["child_session_id"]
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["harness"] == "claude-native"
+    assert "omnigent.ui" not in snapshot.json()["labels"]
+
+
+async def test_unbound_session_skips_terminal_view_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """A session created without a host must not carry the label.
+
+    With no host there is no runner to auto-create a REPL terminal, so
+    the label would leave the Web UI showing a Terminal pill that can
+    never open.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    assert "omnigent.ui" not in resp.json()["labels"]
+
+
+async def test_inline_launch_failure_still_returns_bound_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """When the host reports the launch failed, the inline path still
+    returns 201 with the runner bound — its deliberately lenient
+    contract, distinct from ``POST /v1/hosts/{id}/runners`` (which
+    raises 502 on the same host failure).
+
+    If this starts returning an error status, the divergence with the
+    dedicated launch endpoint has changed and the UI's create flow may
+    surface a hard failure for a session that is actually recoverable.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="failed", launch_error="disk full")
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    # Lenient: launch failure does NOT fail the create.
+    assert resp.status_code == 201, f"expected 201 despite launch failure, got {resp.status_code}"
+    body = resp.json()
+    assert body["host_id"] == _HOST_ID
+    # The runner is bound even though the host declined: the session
+    # row was atomically bound (with a real token-derived id) before
+    # the launch frame was sent, and the failure path leaves it in
+    # place for a later relaunch rather than rolling it back.
+    assert body["runner_id"].startswith("runner_token_"), (
+        f"a token-bound runner_id should be set despite launch failure, got {body['runner_id']!r}"
+    )
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.runner_id == body["runner_id"], (
+        "runner binding should persist even when the host reports launch failure"
+    )
+    assert conv.host_id == _HOST_ID
+
+
+@pytest.fixture
+def _uncached_launch_budget() -> Iterator[None]:
+    """Let a test set the launch budget, and leave no cached value behind.
+
+    :func:`resolve_launch_timeout_s` caches for the process lifetime, so
+    clearing on the way out matters even when the test fails.
+    """
+    resolve_launch_timeout_s.cache_clear()
+    try:
+        yield
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+
+
+async def test_inline_launch_timeout_honors_the_configured_budget(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    _uncached_launch_budget: None,
+) -> None:
+    """A launch that never answers is failed at the CONFIGURED budget, not the
+    built-in 30s.
+
+    Launches that build a container sandbox, pull an image or start the app the
+    agent will test legitimately run past 30s, and failing them loses a session
+    nothing was wrong with. The budget is operator-tunable; this pins that the
+    inline create path reads it. Driven downward (1s) so the assertion is fast —
+    the same wiring is what lets a deployment drive it upward.
+    """
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "1")
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    async def _answer_stat_but_never_the_launch() -> None:
+        """Validate the workspace, then leave the launch unanswered."""
+        deadline = Deadline(30.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+        raise AssertionError("host never received a launch frame from the inline path")
+
+    responder = asyncio.create_task(_answer_stat_but_never_the_launch())
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        )
+    elapsed = time.monotonic() - started
+    await responder
+
+    # Lenient inline contract: the create still returns the bound session.
+    assert resp.status_code == 201, f"expected 201 despite launch timeout, got {resp.status_code}"
+    # The point of the test: it gave up at the configured 1s, so the
+    # hard-coded 30s is no longer what bounds a launch. Unscaled on purpose:
+    # a CI-scaled budget would exceed 30s and pass against the old wait.
+    assert elapsed < 20.0, (
+        f"create waited {elapsed:.1f}s — the configured launch budget was ignored"
+    )
+    assert "host launch timed out after 1s" in caplog.text
+    assert LAUNCH_TIMEOUT_ENV_VAR in caplog.text, (
+        "the timeout error should name the override so an operator can raise it"
+    )
+
+
+@pytest.mark.parametrize("disconnect", [False, True], ids=["replaced", "disconnected"])
+async def test_inline_launch_connection_loss_still_returns_bound_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect: bool,
+) -> None:
+    """Replace the transport after workspace validation, before launch enqueueing."""
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    registry = app.state.host_registry
+    original_send = registry.send_text
+    old_connection = registry.get(_HOST_ID)
+    assert old_connection is not None
+    pending_launches: list[asyncio.Future[dict[str, str | None]]] = []
+
+    def send_with_connection_loss(conn: HostConnection, data: str) -> None:
+        frame = decode_host_frame(data)
+        if isinstance(frame, HostStatFrame):
+            conn.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+            return
+        if isinstance(frame, HostLaunchRunnerFrame):
+            pending_launches.append(conn.pending_launches[frame.request_id])
+            if disconnect:
+                registry.deregister(conn.host_id, workspace_id=conn.workspace_id, conn=conn)
+            else:
+                registry.register(
+                    conn.host_id,
+                    _NoopRunnerWS(),
+                    conn.hello,
+                    conn.owner,
+                    workspace_id=conn.workspace_id,
+                )
+        original_send(conn, data)
+
+    monkeypatch.setattr(registry, "send_text", send_with_connection_loss)
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"].startswith("runner_token_")
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conversation is not None
+    assert conversation.runner_id == body["runner_id"]
+    assert old_connection.pending_launches == {}
+    assert len(pending_launches) == 1
+    assert pending_launches[0].done()
+    comm.stop()
+
+
+_HARNESS_REFUSAL = (
+    "harness 'codex' is not configured on host 'laptop' — run `omnigent setup` on that machine"
+)
+_WORKSPACE_MISSING_ERROR = "workspace path does not exist: /deleted/worktree"
+
+
+async def test_inline_create_harness_not_configured_stays_lenient(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A ``harness_not_configured`` refusal at CREATE is fully lenient.
+
+    The picker's readiness data can be stale (the user may have run
+    ``omnigent setup`` since the host last connected), so create never
+    gates on it: the session opens (201), the binding is kept, and —
+    unlike the earlier design — NO transcript item is written at create
+    time. The error is deferred to the first-message relaunch (the real
+    runner-start attempt), covered by the next test.
+
+    If create starts persisting an item again, the premature
+    before-you-typed-anything notice this iteration removed is back; if
+    it stops returning 201 or clears the binding, the lenient/recoverable
+    contract regressed.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_HARNESS_REFUSAL,
+            launch_error_code="harness_not_configured",
+        )
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    launch_frame = await responder
+
+    # The create-time launch carries the agent's canonical harness so the
+    # host can run its check; the refusal is just handled leniently.
+    assert launch_frame.harness == "codex", (
+        f"create launch frame should carry the agent's harness, got {launch_frame.harness!r}"
+    )
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"] is not None
+
+    # No transcript item at create — the notice is deferred to the
+    # first-message relaunch path.
+    items = await client.get(f"/v1/sessions/{body['id']}/items")
+    assert items.status_code == 200, items.text
+    assert items.json()["data"] == [], (
+        f"create must persist no transcript item for a refused launch, "
+        f"got {items.json()['data']!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "launch_error_code",
+        "expected_error_code",
+        "launch_error",
+        "expected_fragments",
+        "wrapper_command",
+    ),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            _HARNESS_REFUSAL,
+            ("omnigent setup", "harness 'codex' is not configured"),
+            None,
+        ),
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "",
+            ("isaac omni setup",),
+            "isaac omni",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            None,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /work/repo",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            "runner_crashed",
+            None,
+            "runner log tail: private output",
+            (),
+            None,
+        ),
+    ],
+)
+async def test_message_relaunch_deterministic_failure_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_error_code: str | None,
+    expected_error_code: str | None,
+    launch_error: str,
+    expected_fragments: tuple[str, ...],
+    wrapper_command: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deterministic host relaunch refusal persists user msg + error.
+
+    The first message is the real runner-start attempt. When the host
+    refuses the relaunch with a definite failure, the server
+    consumes the user message and records a sibling ``type="error"`` item
+    carrying the host's actionable message (the web renders it as an
+    error banner) instead of timing out into a generic
+    ``RUNNER_UNAVAILABLE``. The binding is left intact so a later message
+    can relaunch after the underlying host problem is fixed.
+
+    Mutation check: drop the deterministic-failure branch in
+    post_event's relaunch and the message instead 503s with
+    ``runner_unavailable`` and no error item is written — both assertions
+    below fail.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    if wrapper_command is not None:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper_command)
+
+    # Grace=0 so the message takes the relaunch branch immediately instead
+    # of waiting for the (never-connecting) create-bound runner.
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # A mutation that drops the deterministic-failure branch must fail fast
+    # instead of waiting through the production runner-connect timeout.
+    monkeypatch.setattr(
+        routes_events_module,
+        "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
+        0.0,
+    )
+    caplog.set_level(logging.WARNING)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    # Create with a successful create-time launch so the session binds a
+    # runner_id (the fake runner never actually connects).
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+    initial_runner_id = create_resp.json()["runner_id"]
+
+    # Runner offline (none ever connected) → the message relaunches; serve
+    # that relaunch as a harness refusal.
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=launch_error,
+            launch_error_code=launch_error_code,
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Mapped codes carry their owner; uncoded or unmapped ones are left to the
+    # host's own row.
+    expected_category = {
+        HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
+        WORKSPACE_MISSING_ERROR_CODE: "user",
+    }.get(launch_error_code or "")
+    assert refusal.attributes.get("error_category") == expected_category
+    assert refusal.attributes["error_impact"] == "blocking"
+
+    if expected_error_code is None:
+        # Unknown host categories may contain arbitrary runner output and
+        # must not be persisted into the transcript.
+        assert msg_resp.status_code == 503
+        items = await client.get(f"/v1/sessions/{session_id}/items")
+        assert items.status_code == 200, items.text
+        assert items.json()["data"] == []
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None
+        assert conv.host_id == _HOST_ID
+        assert conv.runner_id is not None
+        assert conv.runner_id != initial_runner_id
+        return
+
+    # A safe categorical failure is accepted (not a 503): the server
+    # consumed the message and recorded the failure turn.
+    assert msg_resp.status_code == 202, (
+        f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    # The user's message survives in the transcript.
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hi" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    # A type="error" item carries the safe host refusal (rendered as a banner).
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, (
+        f"expected exactly one error item for the refused relaunch, got {error_items!r}"
+    )
+    assert error_items[0]["code"] == expected_error_code
+    for fragment in expected_fragments:
+        assert fragment in error_items[0]["message"]
+    if expected_error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert error_items[0]["message"] == "workspace path does not exist: /work/repo"
+        assert "SECRET_TOKEN" not in error_items[0]["message"]
+        assert "\n" not in error_items[0]["message"]
+
+    # Binding kept so a later message can relaunch after remediation.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id == _HOST_ID
+    assert conv.runner_id is not None
+    assert conv.runner_id != initial_runner_id
+
+
+@pytest.mark.parametrize(
+    "workspace,expected_detail",
+    [
+        (None, "workspace required"),
+        ("relative/path", "absolute path"),
+    ],
+)
+async def test_inline_launch_rejects_bad_workspace(
+    client: httpx.AsyncClient,
+    workspace: str | None,
+    expected_detail: str,
+) -> None:
+    """``host_id`` set with a missing or non-absolute ``workspace`` is
+    rejected at the route with 400 before any host contact.
+
+    This is the route-level contract behind the wizard's workspace
+    picker (which only submits absolute paths). The lower-level
+    ``validate_workspace`` unit tests don't cover the "workspace
+    required when host_id is set" branch — that check lives in the
+    session-create helper.
+    """
+    agent = await create_test_agent(client)
+    payload: dict[str, object] = {"agent_id": agent["id"], "host_id": _HOST_ID}
+    if workspace is not None:
+        payload["workspace"] = workspace
+
+    resp = await client.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+    assert expected_detail in resp.text
+
+
+async def _inline_launch_session(
+    client: httpx.AsyncClient, comm: ApplicationCommunicator, *, harness: str | None = None
+) -> dict[str, str]:
+    """Inline-launch a host-bound session and return its id + runner_id.
+
+    Drives ``POST /v1/sessions`` with ``host_id`` + ``workspace`` while
+    answering the host's stat + launch round-trips, so the returned
+    session has ``host_id`` and a token-bound ``runner_id`` persisted —
+    the shape the Stop / health / relaunch paths read.
+
+    :param client: Test HTTP client bound to the host-wired app.
+    :param comm: Connected host communicator.
+    :param harness: Optional native harness for the uploaded agent.
+    :returns: ``{"id": <session id>, "runner_id": <token-bound id>}``.
+    """
+    executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
+    agent = await create_test_agent(client, executor=executor)
+    launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await launch_responder
+    assert create_resp.status_code == 201, create_resp.text
+    return {"id": create_resp.json()["id"], "runner_id": create_resp.json()["runner_id"]}
+
+
+async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) -> str:
+    """Create a native host session, then disconnect its host tunnel."""
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert response.status_code == 201, response.text
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    assert app.state.host_registry.get(_HOST_ID) is None
+    return response.json()["id"]
+
+
+@pytest.mark.parametrize("has_runner_binding", [True, False])
+async def test_offline_host_gets_real_grace_before_native_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    has_runner_binding: bool,
+) -> None:
+    """An absent host is waited for even when no runner ID was ever assigned."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = await _offline_native_host_session(client, app)
+    if not has_runner_binding:
+        SqlAlchemyConversationStore(db_uri).clear_runner_id(session_id)
+    set_runner_client(None)
+    grace_s = 0.15
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", grace_s)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    started = time.monotonic()
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    assert time.monotonic() - started >= grace_s
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    # The host never came back, so the failure names it rather than a runner start.
+    assert errors[0]["message"] == _host_offline_message()
+    assert len([item for item in items if item.get("role") == "user"]) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("to reconnect for session" in message for message in messages)
+    assert not any("to spawn a runner for session" in message for message in messages)
+    [wait_event] = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event_name") == "runner_client_wait"
+    ]
+    assert wait_event.attributes["outcome"] == "host_offline"
+
+
+async def test_side_chat_send_names_its_source_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat whose source's host is offline fails with the host-offline cause.
+
+    The side chat has no host of its own; it runs on its source's runner, so
+    the source's offline host is why no runner could start.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    source_id = await _offline_native_host_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.get_conversation(source_id)
+    assert source is not None and source.runner_id is not None
+    side_chat = store.create_conversation(
+        agent_id=source.agent_id,
+        runner_id=source.runner_id,
+        labels={
+            **(source.labels or {}),
+            "omnigent.side_chat": "1",
+            "omnigent.side_chat.source_id": source_id,
+        },
+    )
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+
+    response = await client.post(
+        f"/v1/sessions/{side_chat.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{side_chat.id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _host_offline_message()
+
+
+async def test_offline_host_send_held_by_client_records_nothing(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A client that resends after reconnect gets a refusal, not a failed turn."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = await _offline_native_host_session(client, app)
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        headers={"x-omnigent-hold-when-host-offline": "on"},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "host_offline"
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item for item in items if item["type"] == "error"] == []
+    assert [item for item in items if item.get("role") == "user"] == []
+    session = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert session.get("status") != "failed"
+    [wait_event] = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event_name") == "runner_client_wait"
+    ]
+    assert wait_event.attributes["outcome"] == "host_offline_held"
+    assert wait_event.attributes["attempts"] == 0
+
+
+async def test_host_reconnect_on_another_replica_redirects_without_failing_input(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A host returning elsewhere during grace must not create a failed turn."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = await _offline_native_host_session(client, app)
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(2.0))
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    pending = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    )
+    try:
+        async with asyncio.timeout(budget(5.0)):
+            while not any("to reconnect for session" in r.getMessage() for r in caplog.records):
+                await asyncio.sleep(0.01)
+        # A different replica updates the shared row but owns the only tunnel.
+        host = app.state.host_store.get_host(_HOST_ID)
+        app.state.host_store.upsert_on_connect(host.host_id, host.name, host.user_id)
+        response = await asyncio.wait_for(pending, timeout=budget(5.0))
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "wrong_replica"
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert not [item for item in items if item["type"] in {"message", "error"}]
+
+
+async def test_concurrent_sends_after_host_reconnect_share_one_launch(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Waiting senders ride one replacement and initialize before dispatch."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(5.0))
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    requests: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    store = SqlAlchemyConversationStore(db_uri)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+
+        async def resolve(sid: str, router: object, **kwargs: Any) -> httpx.AsyncClient | None:
+            conv = kwargs.get("conversation") or store.get_conversation(sid)
+            return runner if app.state.tunnel_registry.get(conv.runner_id) else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        pending = [
+            asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    },
+                )
+            )
+            for text in ("first", "second")
+        ]
+        try:
+            async with asyncio.timeout(budget(5.0)):
+                while (
+                    sum("to reconnect for session" in r.getMessage() for r in caplog.records) < 2
+                ):
+                    await asyncio.sleep(0.01)
+            reconnected = await _connect_host(app)
+            launch = await _serve_one_launch(reconnected, launch_status="launched")
+            new_runner_id = token_bound_runner_id(launch.binding_token)
+            app.state.tunnel_registry.register(new_runner_id, _NoopRunnerWS(), _runner_hello())
+            responses = await asyncio.wait_for(asyncio.gather(*pending), timeout=budget(5.0))
+            assert all(response.status_code == 202 for response in responses), [
+                response.text for response in responses
+            ]
+            assert not await _expect_no_launch(reconnected, budget_s=budget(0.2))
+            assert new_runner_id != session["runner_id"]
+            assert store.get_conversation(session_id).runner_id == new_runner_id
+            paths = [request.url.path for request in requests if request.method == "POST"]
+            assert paths[0] == "/v1/sessions"
+            assert paths.count(f"/v1/sessions/{session_id}/events") == 2
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def test_send_rides_replacement_started_during_host_grace(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send leaving host grace must join an already-booting replacement."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(5.0))
+    in_host_grace = asyncio.Event()
+    replacement_started = asyncio.Event()
+    wait_for_host = routes_events._wait_for_host_reconnect
+
+    async def wait_until_replacement_started(*args: Any, **kwargs: Any) -> HostConnection | None:
+        in_host_grace.set()
+        connection = await wait_for_host(*args, **kwargs)
+        await replacement_started.wait()
+        return connection
+
+    monkeypatch.setattr(routes_events, "_wait_for_host_reconnect", wait_until_replacement_started)
+    store = SqlAlchemyConversationStore(db_uri)
+    requests: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+
+        async def resolve(sid: str, router: object, **kwargs: Any) -> httpx.AsyncClient | None:
+            conv = kwargs.get("conversation") or store.get_conversation(sid)
+            return runner if app.state.tunnel_registry.get(conv.runner_id) else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+
+        async def send(text: str) -> httpx.Response:
+            return await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                },
+            )
+
+        pending = [asyncio.create_task(send("waiting through host grace"))]
+        try:
+            await asyncio.wait_for(in_host_grace.wait(), timeout=budget(5.0))
+            reconnected = await _connect_host(app)
+            pending.append(asyncio.create_task(send("arriving after reconnect")))
+            launch = await _serve_one_launch(reconnected, launch_status="launched")
+            new_runner_id = token_bound_runner_id(launch.binding_token)
+            assert store.get_conversation(session_id).runner_id == new_runner_id
+
+            # Resume the first send after the second rotated the binding, but
+            # before the replacement tunnel connects. Both must await that runner.
+            replacement_started.set()
+            async with asyncio.timeout(budget(5.0)):
+                while app.state.tunnel_registry.connect_waiter_count(new_runner_id) != 2:
+                    await asyncio.sleep(0.01)
+            app.state.tunnel_registry.register(new_runner_id, _NoopRunnerWS(), _runner_hello())
+            responses = await asyncio.wait_for(asyncio.gather(*pending), timeout=budget(5.0))
+            assert all(response.status_code == 202 for response in responses), [
+                response.text for response in responses
+            ]
+            assert store.get_conversation(session_id).runner_id == new_runner_id
+            assert new_runner_id != session["runner_id"]
+            assert not await _expect_no_launch(reconnected, budget_s=budget(0.2))
+            forwarded = [
+                json.loads(request.content)["content"][0]["text"]
+                for request in requests
+                if request.method == "POST" and request.url.path.endswith("/events")
+            ]
+            assert sorted(forwarded) == [
+                "arriving after reconnect",
+                "waiting through host grace",
+            ]
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _stop_host_session(
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    session_id: str,
+) -> str:
+    """Drive ``stop_session`` and serve the host's stop_runner round-trip.
+
+    Installs a fake global runner client that 204s the pane-kill forward
+    (``_stop_session_via_runner`` falls back to it because no runner
+    tunnel is registered in the host-only test app), POSTs the
+    ``stop_session`` control event, and answers the host's
+    ``host.stop_runner``.
+
+    :param client: Test HTTP client.
+    :param comm: Connected host communicator.
+    :param session_id: Session to stop, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
+    :returns: The ``runner_id`` the host was told to stop.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _runner_handler(request: httpx.Request) -> httpx.Response:
+        """204 every runner POST (pane-kill forward) and snapshot GET."""
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        stop_responder = asyncio.create_task(_serve_one_stop(comm))
+        stop_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        stopped_runner_id = await stop_responder
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert stop_resp.status_code == 202, stop_resp.text
+    # stop_session is a control event, not a persisted item.
+    assert stop_resp.json() == {"queued": False}, stop_resp.json()
+    return stopped_runner_id
+
+
+async def test_stop_session_stops_host_launched_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """``stop_session`` on a host-launched session also stops the runner.
+
+    Killing the claude pane alone leaves the host-launched runner
+    connected. The server must additionally send the host a
+    ``host.stop_runner`` for the session's bound runner so the runner's
+    tunnel drops. This pins that end-to-end forward: a real host over the
+    WS tunnel, a real inline-launched session (host_id + token-bound
+    runner_id on the conv row), and an assertion that the host receives a
+    stop frame targeting *that* runner. If the Stop handler stopped
+    forwarding to the host, ``_serve_one_stop`` would never see the frame.
+    """
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+
+    stopped_runner_id = await _stop_host_session(client, comm, session["id"])
+
+    # The host was asked to stop the SAME runner the session is bound to —
+    # proving the Stop handler read host_id/runner_id off the session row
+    # and forwarded a stop_runner for it. A wrong/empty id would mean the
+    # teardown targeted the wrong runner (or didn't run).
+    assert stopped_runner_id == session["runner_id"], (
+        f"host should be told to stop the session's bound runner "
+        f"{session['runner_id']!r}, got {stopped_runner_id!r}"
+    )
+
+
+@pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
+async def test_stop_session_requires_confirmed_host_runner_exit(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str | None,
+) -> None:
+    """An unacknowledged stop succeeds only when the host confirms the runner is gone."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    if runner_status == "offline":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=True))
+    host_stop = AsyncMock(return_value=False)
+    status_query = AsyncMock(return_value=runner_status)
+    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", host_stop)
+    monkeypatch.setattr(routes_events, "_query_host_runner_status", status_query)
+    stopped = runner_status in {"dead", "unknown"}
+    try:
+        for _ in range(2 if stopped else 1):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == (202 if stopped else 503), response.text
+        if runner_status == "offline":
+            status_query.assert_not_awaited()
+        else:
+            assert status_query.await_args.args[2] == session["runner_id"]
+        if not stopped:
+            assert session_id in routes_events._interrupt_fenced_sessions
+        assert host_stop.await_count == (2 if stopped else 1)
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_stopped_host_session_writes_no_label_and_host_stays_online(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """After Stop, no marker is written and the host stays reachable.
+
+    Stop is non-sticky (WS-S2): it kills the host-launched runner but
+    writes NO persistent marker. With the host's ``omnigent host``
+    tunnel still open, ``GET /health`` keeps reporting ``host_online:
+    true`` — the relaunch affordance the open-session view needs — so the
+    next message auto-relaunches via the normal dispatch path (covered by
+    :func:`test_stopped_host_session_message_relaunches_runner`).
+
+    Asserts the post-Stop liveness reports the host still online and that
+    NO ``omnigent.stopped`` label is persisted. Mutation check: re-add a
+    sticky stop-label write and the no-label assertion fails.
+    """
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    await _stop_host_session(client, comm, session_id)
+
+    # The host's tunnel is still open, so host_online stays true: the
+    # session is still relaunch-eligible on the next message.
+    health = await client.get(f"/health?session_ids={session_id}")
+    liveness = health.json()["sessions"][session_id]
+    assert liveness["host_online"] is True, (
+        "the host's tunnel is still open after Stop, so host_online must "
+        "stay true so the next message can relaunch the runner"
+    )
+
+    # Stop is non-sticky: no persistent marker is written. A re-introduced
+    # sticky label would resurface the retired omnigent.stopped behavior.
+    snap = await client.get(f"/v1/sessions/{session_id}")
+    assert "omnigent.stopped" not in snap.json()["labels"], (
+        f"Stop must NOT persist any omnigent.stopped label; got {snap.json()['labels']!r}"
+    )
+
+
+async def test_stopped_host_session_message_relaunches_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message to a stopped host session relaunches the runner.
+
+    Stop is non-sticky (WS-S2): it kills the current runner but writes no
+    marker, so a subsequent message must auto-relaunch the session on its
+    still-online host via the normal message-dispatch relaunch path —
+    exactly as if the runner had merely died. This is the behavior that
+    replaces the retired ``resume_session`` machinery.
+
+    Asserts that after Stop, posting a message sends the host a
+    ``host.launch_runner`` and rotates the conversation ``runner_id`` to a
+    fresh token-bound id. Mutation check: re-add the deliberate-stop guard
+    to the relaunch branch and no launch frame is sent — the first
+    assertion fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # After Stop the conversation still carries host_id + the (now-dead)
+    # runner_id binding; capture it to prove the relaunch rotates it.
+    stopped_conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stopped_conv is not None
+    original_runner_id = stopped_conv.runner_id
+
+    # No runner client resolves now: the message path must take the
+    # host-relaunch branch (no stop guard blocks it any more).
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    )
+    try:
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+    finally:
+        # No runner ever connects, so cancel before the ~30s wait loop —
+        # the relaunch frame + runner_id rotation already happened.
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, (
+        "a message to a stopped (non-sticky) host session must trigger "
+        "host.launch_runner so the host re-spawns a runner; none arrived — "
+        "a stale stop guard is still blocking the relaunch branch"
+    )
+    assert launch_frame.workspace == _WORKSPACE, (
+        f"relaunch should carry the session workspace {_WORKSPACE!r}, "
+        f"got {launch_frame.workspace!r}"
+    )
+
+    # The relaunch minted a fresh token-bound runner_id so the server stops
+    # routing to the dead runner — same rotation the offline-runner path does.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is not None and conv.runner_id.startswith("runner_token_"), (
+        f"relaunch should rebind a token-derived runner_id, got {conv.runner_id!r}"
+    )
+    assert conv.runner_id != original_runner_id, (
+        "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
+        "would keep routing messages to the dead runner"
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["claude-code-native-ui", "codex-native-ui"])
+@pytest.mark.parametrize("liveness_source", ["missing", "local", "sibling"])
+async def test_message_relaunch_classifies_replacement_runner_liveness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
+    liveness_source: str,
+) -> None:
+    """Only the replacement's sibling heartbeat can redirect a failed connect."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    old_runner_id = session["runner_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(session_id, {"omnigent.wrapper": wrapper})
+    old_stamp = int(time.time())
+    store.touch_runner_liveness([old_runner_id], old_stamp)
+    own_stamps = {old_runner_id: old_stamp}
+    monkeypatch.setattr(routes_events, "last_liveness_stamp", own_stamps.get)
+    waited_for: list[str] = []
+
+    async def _replacement_connect_miss(*_args: Any, runner_id: str, **_kwargs: Any) -> None:
+        assert runner_id != old_runner_id
+        waited_for.append(runner_id)
+        if liveness_source != "missing":
+            stamp = int(time.time())
+            store.touch_runner_liveness([runner_id], stamp)
+            if liveness_source == "local":
+                own_stamps[runner_id] = stamp
+
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _replacement_connect_miss)
+    set_runner_client(None)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+        launch = await responder
+    finally:
+        responder.cancel()
+        await asyncio.gather(responder, return_exceptions=True)
+
+    assert waited_for == [token_bound_runner_id(launch.binding_token)]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    if liveness_source == "sibling":
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "wrong_replica", response.text
+        assert not [item for item in items if item["type"] in {"message", "error"}], items
+    else:
+        assert response.status_code == 202, response.text
+        assert len([item for item in items if item["type"] == "message"]) == 1, items
+        errors = [item for item in items if item["type"] == "error"]
+        assert len(errors) == 1, items
+        assert errors[0]["code"] == "runner_failed_to_start"
+
+
+async def test_message_relaunch_never_connected_names_phase_and_logs_error(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name the failed phase in the 503 and log a correlated ERROR."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Bound the connect wait for this test.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # Force a host relaunch that never gains a runner connection.
+    set_runner_client(None)
+    caplog.set_level(logging.INFO)
+    launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    # Keep the phase-specific detail.
+    assert "never connected to the server" in error["message"], error["message"]
+    assert "runner_token_" in error["message"], error["message"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    correlated_errors = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR and conv.runner_id in r.getMessage()
+    ]
+    assert correlated_errors, (
+        "expected an ERROR-level record naming the launched runner token; "
+        "ERROR records seen: "
+        f"{[r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]}"
+    )
+    assert any(session_id in r.getMessage() for r in correlated_errors), (
+        "the never-connected ERROR must also carry the session id"
+    )
+
+
+async def _relaunch_then_report_exit(
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    session_id: str,
+    daemon_report: str,
+) -> httpx.Response:
+    """Relaunch, then send a pre-connect exit report over the host tunnel.
+
+    The exit report should settle the pending send before its timeout.
+    """
+
+    async def _launch_then_report() -> None:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        frame = HostRunnerExitedFrame(
+            runner_id=token_bound_runner_id(launch.binding_token),
+            error=daemon_report,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(frame)})
+
+    responder = asyncio.create_task(_launch_then_report())
+    try:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+
+async def test_message_relaunch_host_failure_uncategorized_reports_startup_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report an uncategorized host refusal as a failed start, not launch."""
+    caplog.set_level(logging.WARNING)
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    launch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error="failed to spawn runner: boom",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "could not start runner" in error["message"], error["message"]
+    assert "failed to spawn runner: boom" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+    assert "never connected" not in error["message"], error["message"]
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Uncoded: the host's own row carries the category.
+    assert refusal.attributes.get("error_category") is None
+    assert refusal.attributes["error_impact"] == "blocking"
+
+    # The refusal text must never enter RunnerExitReports: the session
+    # snapshot reads that store UNscoped (last_task_error), so a record
+    # here would hand any read-level collaborator the raw host text the
+    # 503 above deliberately owner-scopes.
+    snap = await client.get(f"/v1/sessions/{session_id}")
+    assert snap.status_code == 200, snap.text
+    assert "failed to spawn runner: boom" not in snap.text, (
+        "host launch-refusal text leaked into the session snapshot"
+    )
+
+
+async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Do not claim a launch when the host never acknowledged it."""
+    caplog.set_level(logging.WARNING)
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+
+    async def _serve_stat_only() -> None:
+        """Answer the relaunch's stat and swallow the launch frame."""
+        deadline = Deadline(20.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(5.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+
+    responder = asyncio.create_task(_serve_stat_only())
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "never confirmed the launch" in error["message"], error["message"]
+    assert "The host was asked to launch runner" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+    [timeout] = [
+        r for r in caplog.records if r.getMessage() == "Host launch acknowledgement timed out"
+    ]
+    assert timeout.attributes["error_category"] == "host"
+    assert timeout.attributes["error_impact"] == "transient"
+
+
+async def _native_host_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    comm: ApplicationCommunicator,
+) -> str:
+    """Inline-launch a host session, label it a native terminal, and return its id.
+
+    No runner ever registers for the launched binding, so the next message
+    finds no runner and takes the host relaunch path.
+    """
+    from omnigent.runtime import set_runner_client
+
+    session = await _inline_launch_session(client, comm)
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"], {"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    set_runner_client(None)
+    return session["id"]
+
+
+async def _swallow_relaunch_launch_frame(
+    comm: ApplicationCommunicator, *, then_disconnect: bool
+) -> None:
+    """Answer the relaunch's stat, then swallow its launch frame unacknowledged.
+
+    Mimics a host whose link is half-open: it receives nothing it can answer.
+    With ``then_disconnect`` the host's tunnel is dropped right after, as when
+    the machine goes away mid-launch.
+
+    :param comm: The connected host communicator.
+    :param then_disconnect: Drop the host tunnel once the launch frame arrives.
+    """
+    deadline = Deadline(20.0)
+    for _ in range(40):
+        output = await comm.receive_output(timeout=deadline.next_wait(5.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=True,
+                            type="directory",
+                            canonical_path=frame.path,
+                        )
+                    ),
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            if then_disconnect:
+                await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+                await comm.wait(timeout=budget(5.0))
+            return
+
+
+async def _post_hello(client: httpx.AsyncClient, session_id: str) -> httpx.Response:
+    """Post a plain user message to a session."""
+    return await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+
+def _runner_client_wait_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the structured ``runner_client_wait`` records captured so far."""
+    return [r for r in caplog.records if r.__dict__.get("event_name") == "runner_client_wait"]
+
+
+@pytest.mark.parametrize("replace_host_during_launch", [False, True])
+async def test_message_relaunch_resolves_runner_client_that_misses_after_connect(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    replace_host_during_launch: bool,
+) -> None:
+    """A relaunched runner that connected is used even when its first lookups miss.
+
+    The tunnel registers but the routed client lookup misses twice (the binding
+    the router checks settles a moment later). The wait must retry instead of
+    reporting a runner that is up as unavailable.
+
+    Mutation check: resolve with a single lookup after the connect and the send
+    fails 503 instead of reaching the runner.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from tests._helpers.polling import poll_until_async
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_RUNNER_CLIENT_RESOLVE_RETRY_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    forwarded: list[str] = []
+    forwarded_events: list[dict[str, Any]] = []
+    host_replaced = asyncio.Event()
+    real_admit = app.state.host_registry.admit_launch
+    admissions: list[HostConnection] = []
+
+    async def reconnect_after_admission(conn: HostConnection, sid: str) -> None:
+        nonlocal comm
+        await real_admit(conn, sid)
+        admissions.append(conn)
+        if len(admissions) == 1:
+            comm = await _connect_host(app)
+            await poll_until_async(
+                lambda: app.state.host_registry.get(_HOST_ID) is not conn,
+                timeout_s=budget(5.0),
+            )
+            host_replaced.set()
+
+    if replace_host_during_launch:
+        monkeypatch.setattr(app.state.host_registry, "admit_launch", reconnect_after_admission)
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        if request.url.path.endswith("/events"):
+            forwarded_events.append(json.loads(request.content))
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+    relaunched: list[str] = []
+    lookups_after_connect = 0
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        nonlocal lookups_after_connect
+        if not relaunched or app.state.tunnel_registry.get(relaunched[0]) is None:
+            return None
+        lookups_after_connect += 1
+        return None if lookups_after_connect <= 2 else fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        if replace_host_during_launch:
+            await asyncio.wait_for(host_replaced.wait(), timeout=budget(5.0))
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        runner_id = token_bound_runner_id(launch.binding_token)
+        relaunched.append(runner_id)
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(10.0))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert lookups_after_connect == 3
+    assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    assert forwarded_events[0]["content"] == [{"type": "input_text", "text": "hello"}]
+    if replace_host_during_launch:
+        assert len(admissions) == 2 and admissions[0] is not admissions[1]
+        assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+    [event] = _runner_client_wait_events(caplog)
+    assert (event.attributes["outcome"], event.attributes["attempts"]) == ("resolved", 3)
+
+
+async def test_message_relaunch_waits_longer_for_a_runner_the_host_spawned(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner the host confirmed spawning may connect after the base budget.
+
+    A busy machine can take a few seconds past the 30 s budget to boot the
+    runner; the message must reach it instead of failing as unavailable.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    base_timeout_s = 1.0
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", base_timeout_s)
+    # The fake host never answers status probes; keep them from outlasting the budget.
+    monkeypatch.setattr(sessions_module, "_HOST_RUNNER_STATUS_TIMEOUT_S", 0.05)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    forwarded: list[str] = []
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+    relaunched: list[str] = []
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        if not relaunched or app.state.tunnel_registry.get(relaunched[0]) is None:
+            return None
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        runner_id = token_bound_runner_id(launch.binding_token)
+        relaunched.append(runner_id)
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        # Connect after the base budget but well inside the doubled one.
+        await asyncio.sleep(base_timeout_s * 1.4)
+        assert not post.done(), "the send gave up at the base connect budget"
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(10.0))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+
+
+async def test_native_message_relaunch_runner_never_connects_keeps_runner_failed_to_start(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner the host launched that never connects still reads as a failed start.
+
+    The host acknowledged the launch, so the failure is the runner's, not the
+    host's. It lands at the existing connect deadline, without any client lookup.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.3)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    started = time.monotonic()
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _RUNNER_NOT_AVAILABLE
+    # Failed at the (shortened) connect deadline, not after extra lookup retries.
+    assert elapsed < 0.3 + budget(5.0)
+    [event] = _runner_client_wait_events(caplog)
+    assert (event.attributes["outcome"], event.attributes["attempts"]) == ("never_connected", 0)
+
+
+async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A launch the connected host never answered refuses the send instead of failing the turn.
+
+    Nothing shows a runner failed to start, so the message is not consumed and the
+    host is not called offline; the client keeps the message to resend.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=False))
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable"
+    assert app.state.host_registry.get(_HOST_ID) is not None
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
+    assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
+        "never_connected"
+    ]
+
+
+async def test_native_message_relaunch_host_lost_after_launch_reports_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A host that drops right after the launch frame fails the send as offline, promptly."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=True))
+    started = time.monotonic()
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 202, response.text
+    assert elapsed < 0.4 + budget(5.0)
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _host_offline_message()
+    assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
+        "never_connected",
+        "host_offline",
+    ]
+
+
+async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Include a visible pre-connect exit report in the 503 detail."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Let the report, not the timeout, settle the send.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "ValueError: bad tunnel token"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "ValueError: bad tunnel token" in error["message"], error["message"]
+
+
+async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_owner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hide the host owner's log tail from another session viewer.
+
+    Operators still receive the full report in the correlated ERROR.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # The fixture is unauthenticated; pin distinct identities and use the
+    # real get_visible owner check.
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports,
+        runner_id: str,
+        error: str,
+        owner: str | None,
+        *,
+        had_connected: bool | None = None,
+    ) -> None:
+        del owner
+        real_record(
+            self, runner_id, error, owner="host-owner@example.com", had_connected=had_connected
+        )
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "SECRET_TOKEN=hunter2"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "visible to the host owner" in error["message"], error["message"]
+    assert "SECRET_TOKEN" not in error["message"], error["message"]
+    # The operator-facing ERROR still carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_host_reports_runner_unknown_skips_connect_grace(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host verdict of ``unknown`` relaunches without burning the grace.
+
+    This is the host-restart / non-sticky-Stop case: the runner is gone
+    (the host has no record of it), so the pinned ``runner_id`` will never
+    connect. With a generously long connect grace, the ``host.runner_status``
+    query must race the wait and cut it short — the ``host.launch_runner``
+    relaunch has to arrive far inside the grace window, not after it.
+
+    The grace is set to 5s while the launch is expected within a 2s
+    per-receive budget: comfortably longer than the sub-second query
+    round-trip but far shorter than the full grace, so a regression that
+    reinstated the blind wait (ignoring the verdict) would blow the budget
+    and fail here.
+
+    Mutation check: make the dispatch gate ignore the ``dead``/``unknown``
+    verdict (always wait the full grace) and the launch arrives ~5s later —
+    ``_answer_runner_status_then_wait_for_launch`` times out and returns
+    ``None``, failing the assertion.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    # Long grace: a blind wait would take this long; the verdict must beat it.
+    # Scaled with the budget below so the 2:5 margin that detects a blind wait
+    # survives on a slow runner — scaling only the budget would erase it.
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # No runner client resolves: the message path enters the grace/relaunch
+    # block, where the liveness race runs.
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    )
+    try:
+        launch_frame = await _answer_runner_status_then_wait_for_launch(
+            comm, status="unknown", budget_s=budget(2.0)
+        )
+    finally:
+        # No runner ever connects, so the post would otherwise ride the
+        # ~30s relaunch wait — cancel once we've seen the launch frame.
+        post_task.cancel()
+        # return_exceptions drains the cancelled POST without re-raising.
+        await asyncio.gather(post_task, return_exceptions=True)
+
+    assert launch_frame is not None, (
+        "an 'unknown' host verdict must cut the connect grace short and "
+        "relaunch immediately; no host.launch_runner arrived within the "
+        "budget, so the dispatch gate is still waiting out the full grace"
+    )
+    assert launch_frame.workspace == _WORKSPACE
+    # The relaunch mints a fresh runner_id (runner_id rotation itself is
+    # pinned by test_stopped_host_session_message_relaunches_runner); here
+    # the point is purely that the verdict cut the grace short.
+    assert launch_frame.binding_token, "relaunch frame should carry a fresh binding token"
+
+
+@pytest.mark.parametrize("scheduled", [False, True], ids=["interactive", "scheduled"])
+async def test_host_session_message_relaunches_offline_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
+) -> None:
+    """A message to a host session whose runner is offline (but NOT
+    deliberately stopped) asks the host to launch a fresh runner.
+
+    This is the positive counterpart to
+    ``test_stopped_host_session_message_does_not_relaunch_runner`` and the
+    recovery path the inline launch's *lenient* contract relies on: when
+    the initial host launch fails (``test_inline_launch_failure_still_
+    returns_bound_session``) or the runner later dies, the session keeps
+    its ``host_id`` + bound ``runner_id``, and the next message must
+    re-spawn a runner via ``host.launch_runner`` rather than fail. The
+    relaunch mints a fresh token-bound ``runner_id`` (``replace_runner_id``)
+    so the server routes to the new runner, not the dead one.
+
+    Mutation check: drop the relaunch branch (or its ``conv.host_id`` arm)
+    in ``post_event`` and no launch frame is sent — ``_wait_for_launch``
+    returns ``None`` and the first assertion fails. Make ``replace_runner_id``
+    a no-op and the runner_id-rotation assertion fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    # Runner offline (no runner client resolves) and the session was never
+    # stopped: the message path must take the host-relaunch branch.
+    occurrence = (
+        ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            trigger_key="cron:1000",
+            target="connected_host",
+            session_mode="continue",
+        )
+        if scheduled
+        else None
+    )
+    set_runner_client(None)
+    with scheduled_run_scope(occurrence):
+        post_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                },
+            )
+        )
+    try:
+        # The launch frame is sent (and the runner_id rotated) before the
+        # route's 30s wait-for-runner loop, so a small budget suffices;
+        # None means no relaunch fired.
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+    finally:
+        # We never connect a runner, so the route would otherwise block
+        # ~30s in its wait loop. Cancel now that we've observed (or missed)
+        # the relaunch — the rotation + frame send already happened
+        # synchronously, so the assertions below remain valid.
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, (
+        "a message to a host-bound, runner-offline, non-stopped session must "
+        "trigger host.launch_runner so the host can re-spawn a runner; none "
+        "arrived — the relaunch branch in post_event did not fire"
+    )
+    assert launch_frame.scheduled_run == occurrence
+    # Relaunch forwards the session's canonical workspace (not garbage),
+    # proving it read the persisted workspace off the conversation row.
+    assert launch_frame.workspace == _WORKSPACE, (
+        f"relaunch should carry the session workspace {_WORKSPACE!r}, "
+        f"got {launch_frame.workspace!r}"
+    )
+
+    # The relaunch minted a fresh token-bound runner_id via
+    # replace_runner_id, distinct from the original binding, so the server
+    # stops routing to the dead runner.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is not None and conv.runner_id.startswith("runner_token_"), (
+        f"relaunch should rebind a token-derived runner_id, got {conv.runner_id!r}"
+    )
+    assert conv.runner_id != original_runner_id, (
+        "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
+        "would keep routing messages to the dead runner"
+    )
+    assert launch_frame.superseded_runner_ids == (original_runner_id,), (
+        "the relaunch must name the binding it replaced so the host stops it"
+    )
+
+
+async def test_unbound_host_session_relaunch_names_no_superseded_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch after /clear moved the runner away supersedes nothing.
+
+    /clear unbinds the old session and hands its runner to the successor; if
+    the launch frame named no runners explicitly, the host would stop every
+    runner it launched for this session, including the successor's.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).clear_runner_id(session_id)
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+    )
+    try:
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, "a message to an unbound host session must relaunch"
+    assert launch_frame.superseded_runner_ids == ()
+
+
+async def test_first_message_during_host_spawn_does_not_launch_replacement(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Drive real host status and server recovery while the initial spawn is paused."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    host = HostProcess(
+        identity=HostIdentity(host_id=_HOST_ID, name="test"), server_url="http://testserver"
+    )
+    loop = asyncio.get_running_loop()
+    spawning = asyncio.Event()
+    status_started = asyncio.Event()
+    replacement_seen = asyncio.Event()
+    release_spawn = threading.Event()
+    launch_frames: list[HostLaunchRunnerFrame] = []
+    stop_frames: list[HostStopRunnerFrame] = []
+    status_results: list[str] = []
+    spawned: list[subprocess.Popen[bytes]] = []
+    forwarded: list[str] = []
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        proc = Mock(spec=subprocess.Popen, pid=1234 + len(spawned))
+        proc.poll.return_value = None
+        spawned.append(proc)
+        loop.call_soon_threadsafe(spawning.set)
+        assert release_spawn.wait(budget(10.0)), "test did not release spawn"
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    class HostWS:
+        async def send(self, raw: str) -> None:
+            frame = decode_host_frame(raw)
+            if isinstance(frame, HostRunnerStatusResultFrame):
+                status_results.append(frame.status)
+            await comm.send_input({"type": "websocket.receive", "text": raw})
+
+    ws = HostWS()
+
+    async def _serve_host() -> None:
+        while True:
+            output = await comm.receive_output(timeout=budget(20.0))
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frames.append(frame)
+                if len(launch_frames) > 1:
+                    replacement_seen.set()
+            if isinstance(frame, HostStopRunnerFrame):
+                stop_frames.append(frame)
+            host._start_frame_task(ws, output["text"])  # type: ignore[arg-type]
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        if (
+            launch_frames
+            and app.state.tunnel_registry.get(
+                token_bound_runner_id(launch_frames[0].binding_token)
+            )
+            is not None
+        ):
+            return fake_runner
+        return None
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _harness: True)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_stop_runner_proc", lambda _proc: None)
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    serve = asyncio.create_task(_serve_host())
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": str(tmp_path),
+            },
+        )
+    )
+    post: asyncio.Task[httpx.Response] | None = None
+    try:
+        await asyncio.wait_for(spawning.wait(), budget(10.0))
+        initial = launch_frames[0]
+        session_id = initial.session_id
+        runner_id = token_bound_runner_id(initial.binding_token)
+        post = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            )
+        )
+        await asyncio.wait_for(status_started.wait(), budget(5.0))
+        # If the buggy host answered immediately, let real server recovery
+        # consume that verdict so the failure identifies the duplicate launch.
+        if status_results == ["unknown"]:
+            await asyncio.wait_for(replacement_seen.wait(), budget(5.0))
+        assert len(launch_frames) == 1, "premature unknown caused a second runner launch"
+        assert not status_results, "status must await the pending spawn"
+
+        release_spawn.set()
+        response = await asyncio.wait_for(create, budget(5.0))
+        assert response.status_code == 201, response.text
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(5.0))
+        assert response.status_code < 300, response.text
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None and conv.runner_id == runner_id
+        assert len(launch_frames) == len(spawned) == 1
+        assert stop_frames == []
+        assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    finally:
+        release_spawn.set()
+        for task in (create, post, serve):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (create, post, serve) if t is not None), return_exceptions=True
+        )
+        await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+        await host._drain_runner_stop_tasks()
+        await asyncio.gather(*host._watcher_tasks, return_exceptions=True)
+        await fake_runner.aclose()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
+
+
+@pytest.mark.parametrize("sign_in_pending", [False, True])
+async def test_host_session_message_waits_for_bound_runner_before_relaunch(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sign_in_pending: bool,
+) -> None:
+    """The first message waits for the already-bound runner to register.
+
+    The Web new-session path binds a token-derived ``runner_id`` and asks
+    the host to spawn that runner before returning. The browser can post
+    the initial message while the host runner process is alive but its
+    tunnel is not registered yet. That must be treated as "runner still
+    starting", not "runner is dead": the server should wait briefly for
+    the existing binding to become routable, run the session-init
+    handshake, and forward the message without sending a second
+    ``host.launch_runner`` or rotating ``runner_id``.
+
+    Mutation check: remove the grace wait before ``_launch_runner_on_host``
+    and this test observes a second host launch frame plus a changed
+    conversation ``runner_id``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    if sign_in_pending:
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
+        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01, raising=False)
+        monkeypatch.setattr(
+            orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
+        )
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    runner_paths: list[str] = []
+    init_bodies: list[dict[str, Any]] = []
+    event_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record runner POSTs and accept session init/message calls.
+
+        :param request: Request the server sent to the runner, e.g.
+            ``POST /v1/sessions`` or ``POST /v1/sessions/<id>/events``.
+        :returns: A success response so the route can complete.
+        """
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+            if request.url.path == "/v1/sessions":
+                init_bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/events"):
+            event_bodies.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    resolve_calls = {"n": 0}
+
+    async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
+        """Simulate the pinned runner becoming routable during grace.
+
+        :param sid: Session id being routed, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
+        :param router: Real app runner router (unused in this staged
+            resolver).
+        :returns: ``None`` first, then the fake runner client.
+        """
+        del router
+        assert sid == session_id
+        resolve_calls["n"] += 1
+        return None if resolve_calls["n"] == 1 else fake_runner
+
+    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
+        """Stand in for ``_ensure_runner_relay_ready`` as a no-op.
+
+        :param args: Ignored positional args from the call site.
+        :param kwargs: Ignored keyword args from the call site.
+        :returns: ``None``.
+        """
+        del args, kwargs
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    try:
+        post_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                },
+            )
+        )
+        await _wait_for_runner_connect_waiter(app, original_runner_id)
+        if sign_in_pending:
+            # Longer than normal startup grace, still inside the explicit sign-in window.
+            await asyncio.sleep(0.1)
+            current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+            assert current is not None and current.runner_id == original_runner_id
+            assert not post_task.done()
+        app.state.tunnel_registry.register(original_runner_id, _NoopRunnerWS(), _runner_hello())
+        resp = await post_task
+    finally:
+        post_task.cancel()
+        await asyncio.gather(post_task, return_exceptions=True)
+        await fake_runner.aclose()
+
+    saw_launch = await _expect_no_launch(comm, budget_s=budget(0.2))
+
+    assert resp.status_code < 300, resp.text
+    assert not saw_launch, (
+        "the initial message should reuse the already-bound runner once it "
+        "registers during the grace wait; a second host.launch_runner means "
+        "the startup race still creates duplicate runners"
+    )
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id == original_runner_id, (
+        f"runner_id should stay on the originally launched runner "
+        f"{original_runner_id!r}; got {conv.runner_id!r}"
+    )
+    assert app.state.tunnel_registry.connect_waiter_count(original_runner_id) == 0, (
+        "connect waiter should be removed after the runner registers"
+    )
+    assert runner_paths and runner_paths[0] == "/v1/sessions", (
+        f"the reused runner still needs session init before message forward; "
+        f"recorded runner POSTs were {runner_paths!r}"
+    )
+    event_paths = [path for path in runner_paths if path.endswith("/events")]
+    assert len(event_bodies) == 1
+    assert event_bodies[0]["content"] == [{"type": "input_text", "text": "hi"}]
+    assert event_paths, (
+        f"the user message should be forwarded after session init; "
+        f"recorded runner POSTs were {runner_paths!r}"
+    )
+    assert init_bodies and init_bodies[0]["session_id"] == session_id, (
+        f"session-init body should target {session_id!r}; got {init_bodies!r}"
+    )
+
+
+@pytest.mark.parametrize("interruption", ["cancel", "stop", "rebind"])
+async def test_pending_sign_in_interruption_does_not_consume_input(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
+    monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
+    monkeypatch.setattr(
+        orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
+    )
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id, runner_id = session["id"], session["runner_id"]
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        await asyncio.sleep(0.1)
+        assert not post.done()
+        if interruption == "cancel":
+            post.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await post
+        else:
+            if interruption == "stop":
+                monkeypatch.setitem(
+                    orchestration._intentional_stop_sessions, session_id, runner_id
+                )
+            else:
+                SqlAlchemyConversationStore(db_uri).replace_runner_id(
+                    session_id, "runner-replacement", expected_runner_id=runner_id
+                )
+            response = await asyncio.wait_for(post, budget(5))
+            assert response.status_code >= 400
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        assert [item for item in items if item["type"] in {"message", "error"}] == []
+        assert app.state.tunnel_registry.connect_waiter_count(runner_id) == 0
+        assert not await _expect_no_launch(comm, budget_s=budget(0.1))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
+
+
+@pytest.mark.parametrize("connected_harness", [None, "claude-native", "codex-native"])
+async def test_relaunch_posts_session_init_before_forwarding_message(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    connected_harness: str | None,
+) -> None:
+    """The auto-relaunch path runs the session-init handshake (POST
+    /v1/sessions) BEFORE forwarding the user's message to the runner.
+
+    This is the fix for the host-restart stuck-bubble bug: a freshly
+    relaunched runner has not run ``create_session`` yet, so for a
+    native session its transcript forwarder is not watching. If the
+    message is injected first, the round-trip that promotes the
+    optimistic bubble and streams the reply never happens. Awaiting the
+    handshake first guarantees the terminal + forwarder are in place
+    before the message lands.
+
+    The invariant is harness-agnostic — the handshake POST must precede
+    the message forward for *any* relaunched session — so a plain agent
+    suffices and keeps the assertion squarely on request ordering.
+
+    ``_get_runner_client`` is staged offline→online to drive the
+    relaunch branch deterministically: the app wires a real
+    ``RunnerRouter`` that can only resolve a runner with a registered
+    tunnel, so simulating "runner reconnects" via a registered tunnel
+    would add unrelated plumbing. Staging the resolver returns ``None``
+    first (relaunch fires) then the recording client (the relaunched
+    runner is now reachable).
+
+    Mutation check: drop the ``_ensure_runner_session_initialized`` call
+    in ``post_event``'s relaunch branch and ``runner_paths`` loses its
+    leading ``/v1/sessions`` POST (first assertion fails). Move it after
+    the forward and the index-ordering assertion fails.
+
+    Connected native cases cover idle reconnects whose initialization was
+    deferred. Their first input still needs the handshake; a second input
+    must reuse the completed initialization.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness=connected_harness)
+    session_id = session["id"]
+
+    # Record runner POSTs in arrival order so we can assert the handshake
+    # precedes the message forward.
+    runner_paths: list[str] = []
+    init_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record runner POSTs in arrival order and accept them.
+
+        :param request: Request the server sent to the relaunched runner,
+            e.g. a POST to ``/v1/sessions`` (handshake) or
+            ``/v1/sessions/<id>/events`` (message forward).
+        :returns: A 2xx so the server proceeds past each step.
+        """
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+            if request.url.path == "/v1/sessions":
+                init_bodies.append(json.loads(request.content))
+                return httpx.Response(
+                    201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+                )
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
+        """Resolve an already-connected native runner, or drive relaunch.
+
+        :param sid: Session id being routed (unused; one session here).
+        :param router: Real app runner router (unused — staged here).
+        :returns: The recording client for connected native cases, else ``None``.
+        """
+        del sid, router
+        return fake_runner if connected_harness else None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)
+
+    async def _staged_wait_for_runner_client(
+        session_id_arg: str,
+        runner_router_arg: object,
+        tunnel_registry_arg: object,
+        *,
+        runner_id: str | None,
+        timeout_s: float,
+        runner_exit_reports: object = None,
+    ) -> httpx.AsyncClient | None:
+        """Return the fake runner after the relaunch helper runs.
+
+        :param session_id_arg: Session id being routed, e.g.
+            ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
+        :param runner_router_arg: Real app runner router (unused here).
+        :param tunnel_registry_arg: Real app tunnel registry (unused here).
+        :param runner_id: Relaunched runner id expected to connect.
+        :param timeout_s: Wait budget requested by the route.
+        :param runner_exit_reports: Crash-report store (unused here; the
+            relaunched runner connects, so no conviction short-circuit).
+        :returns: The recording fake runner client.
+        """
+        del runner_router_arg, tunnel_registry_arg, timeout_s, runner_exit_reports
+        assert session_id_arg == session_id
+        assert runner_id is not None and runner_id.startswith("runner_token_")
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _staged_wait_for_runner_client)
+
+    # Neutralize the SSE relay readiness wait: a MockTransport never
+    # emits the relay's ready heartbeat, so the real wait would 5s-
+    # timeout and 503. The relay is orthogonal to the ordering invariant
+    # here and has its own coverage.
+    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
+        """Stand in for ``_ensure_runner_relay_ready`` as a no-op.
+
+        :param args: Ignored positional args from the call site.
+        :param kwargs: Ignored keyword args from the call site.
+        :returns: ``None`` (no relay handle).
+        """
+        del args, kwargs
+
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    from omnigent.server import child_session_recovery
+
+    restorations: list[str] = []
+    schedule_restoration = child_session_recovery.schedule_child_restoration
+
+    def _record_restoration(parent: Conversation, *args: Any, **kwargs: Any) -> None:
+        restorations.append(parent.id)
+        schedule_restoration(parent, *args, **kwargs)
+
+    monkeypatch.setattr(child_session_recovery, "schedule_child_restoration", _record_restoration)
+
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+        if connected_harness:
+            assert resp.status_code < 300, resp.text
+            second_response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
+                },
+            )
+            assert second_response.status_code < 300, second_response.text
+    finally:
+        # Always close the recording client, even if the POST raised, so a
+        # regression can't leak the AsyncClient / emit unclosed-client warnings.
+        await fake_runner.aclose()
+
+    assert resp.status_code < 300, resp.text
+
+    # Handshake must be recorded AND precede the first /events forward.
+    # Pre-fix: no "/v1/sessions" entry at all. Wrong order: handshake
+    # after the forward → the forwarder isn't watching when the message
+    # lands, reproducing the stuck-bubble bug.
+    assert "/v1/sessions" in runner_paths, (
+        f"relaunch path must POST /v1/sessions (session-init handshake) to the "
+        f"runner before forwarding; recorded runner POSTs were {runner_paths!r}"
+    )
+    event_paths = [p for p in runner_paths if p.endswith("/events")]
+    assert event_paths, (
+        f"the user message should still be forwarded to the runner's /events; "
+        f"recorded runner POSTs were {runner_paths!r}"
+    )
+    assert len(event_paths) == (2 if connected_harness else 1)
+    assert runner_paths.index("/v1/sessions") < runner_paths.index(event_paths[0]), (
+        f"session-init handshake must precede the message forward so the "
+        f"transcript forwarder is watching first; got order {runner_paths!r}"
+    )
+    # The handshake targets this session (proves it's the real init call,
+    # not an unrelated POST): the body carries the session id.
+    assert init_bodies and init_bodies[0]["session_id"] == session_id, (
+        f"handshake body should target session {session_id!r}; got {init_bodies!r}"
+    )
+    assert len(init_bodies) == 1, "later messages must reuse completed initialization"
+    assert restorations == [session_id], "later messages must not schedule child recovery again"
+    from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+
+    envelope = parse_runner_session_init_envelope(init_bodies[0])
+    assert envelope is not None and envelope.suppress_recovery_turn
+
+
+async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening the Goal dialog on a slept Codex-native session runs the
+    session-init handshake (POST /v1/sessions) on the woken runner BEFORE
+    forwarding the goal control event.
+
+    Codex goal state lives in the Codex app-server bridge, which only
+    exists after ``create_session`` runs on the runner. When the Goal
+    dialog wakes a host-bound session whose runner had slept, the goal
+    route relaunches a runner and must run the session-init handshake
+    first — otherwise the goal event lands on a runner with no bridge and
+    is lost. This is the codex-goal sibling of
+    ``test_relaunch_posts_session_init_before_forwarding_message``; the
+    invariant (handshake precedes the forward) is the same, only the
+    triggering path differs.
+
+    The runner-resolution helpers are staged so the route deterministically
+    enters its relaunch branch: no live runner, no already-bound runner,
+    a successful host launch, and a relaunched runner that resolves to the
+    recording client. ``_initialize_codex_goal_runner`` (and the handshake
+    it drives) run for real against that client.
+
+    Regression / mutation check: dropping the ``conversation_store`` arg
+    from the ``_ensure_runner_session_initialized`` call in
+    ``_initialize_codex_goal_runner`` (the exact pre-fix state) makes that
+    call raise ``TypeError`` before any handshake POST — ``runner_paths``
+    loses its ``/v1/sessions`` entry (first assertion fails) and the route
+    500s. Moving the init after the goal-event forward fails the ordering
+    assertion.
+    """
+    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.server.routes.codex import sessions as codex_sessions_module
+
+    # Inline-launch a host-bound session (the goal relaunch path bails early
+    # unless ``conv.host_id`` is set), then mark it codex-native so the goal
+    # route accepts it (``_require_codex_native_goal_session`` keys off this
+    # label). Its runner is treated as slept — the resolution helpers below
+    # are staged to force the relaunch branch.
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id, {WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE}
+    )
+
+    # Record runner POSTs in arrival order so we can assert the handshake
+    # precedes the goal-event forward.
+    runner_paths: list[str] = []
+    init_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record runner POSTs in arrival order and accept them.
+
+        :param request: Request the server sent to the relaunched runner —
+            a POST to ``/v1/sessions`` (handshake) or
+            ``/v1/sessions/<id>/events`` (goal-event forward).
+        :returns: A 2xx so the route proceeds past each step; the /events
+            reply is a valid ``CodexGoalResponse`` body.
+        """
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+            if request.url.path == "/v1/sessions":
+                init_bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"goal": None})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _no_live_runner(
+        session_id_arg: str, runner_router_arg: object, event: dict[str, Any]
+    ) -> None:
+        """Return ``None`` so the goal route enters its relaunch branch.
+
+        :param session_id_arg: Session being routed (unused; one session).
+        :param runner_router_arg: App runner router (unused — staged here).
+        :param event: Goal control event (unused; branch is unconditional).
+        :returns: ``None``.
+        """
+        del session_id_arg, runner_router_arg, event
+
+    async def _no_bound_runner(**kwargs: Any) -> None:
+        """Report no already-bound runner so a relaunch is attempted.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: ``None``.
+        """
+        del kwargs
+
+    async def _launched(**kwargs: Any) -> str:
+        """Stand in for a successful host launch.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The runner id expected to connect.
+        """
+        del kwargs
+        return "runner_token_codexgoal"
+
+    async def _relaunched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        """Return the recording fake runner as the relaunched client.
+
+        :param args: Positional args from the call site (unused).
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The recording fake runner client.
+        """
+        del args, kwargs
+        return fake_runner
+
+    monkeypatch.setattr(
+        codex_sessions_module, "_forward_session_change_to_runner", _no_live_runner
+    )
+    monkeypatch.setattr(
+        codex_sessions_module, "_wait_for_existing_codex_goal_runner", _no_bound_runner
+    )
+    monkeypatch.setattr(codex_sessions_module, "_start_codex_goal_runner_on_bound_host", _launched)
+    monkeypatch.setattr(codex_sessions_module, "_wait_for_runner_client", _relaunched_client)
+
+    try:
+        resp = await client.put(
+            f"/v1/sessions/{session_id}/codex_goal",
+            json={"objective": "keep tests green"},
+        )
+    finally:
+        # Always close the recording client so a regression can't leak the
+        # AsyncClient / emit unclosed-client warnings.
+        await fake_runner.aclose()
+
+    assert resp.status_code < 300, resp.text
+
+    # Handshake must be recorded AND precede the goal-event forward.
+    # Pre-fix: the missing ``conversation_store`` arg raises TypeError
+    # before the handshake POST, so there is no "/v1/sessions" entry.
+    assert "/v1/sessions" in runner_paths, (
+        f"goal relaunch must POST /v1/sessions (session-init handshake) to the "
+        f"runner before forwarding the goal event; recorded runner POSTs were "
+        f"{runner_paths!r}"
+    )
+    event_paths = [p for p in runner_paths if p.endswith("/events")]
+    assert event_paths, (
+        f"the goal control event should still be forwarded to the runner's "
+        f"/events; recorded runner POSTs were {runner_paths!r}"
+    )
+    assert runner_paths.index("/v1/sessions") < runner_paths.index(event_paths[0]), (
+        f"session-init handshake must precede the goal-event forward so the "
+        f"Codex app-server bridge is loaded first; got order {runner_paths!r}"
+    )
+    # The handshake targets this session (proves it's the real init call).
+    assert init_bodies and init_bodies[0]["session_id"] == session_id, (
+        f"handshake body should target session {session_id!r}; got {init_bodies!r}"
+    )
+
+
+async def test_health_reports_online_for_host_on_other_replica(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    tmp_path,
+    runtime_init: None,
+) -> None:
+    """``GET /health?session_ids=...`` reads host liveness from the DB, not the local registry.
+
+    Multi-replica regression: the host's WebSocket is on replica A
+    (the test ``app``) where the session is created. Then we query
+    ``/health`` on a *separate* replica B that shares the same DB but
+    has its own empty :class:`HostRegistry`. The runner tunnel lives
+    on replica A's in-memory registry, so on replica B ``runner_online``
+    is (correctly, under strict liveness) ``False`` — but ``host_online``
+    must still be ``True``: the host is perfectly reachable on replica A,
+    and host liveness is the cross-replica signal the open-session view
+    keys off to decide "runner asleep, just send a message" vs "host
+    offline". If the endpoint read host liveness from the per-replica
+    registry instead of the DB, replica B would wrongly report
+    ``host_online: false``.
+
+    Mirrors the fix made in ``GET /v1/hosts``: the
+    ``hosts`` DB row's ``status`` column is the cross-replica
+    source of truth and is what ``_session_liveness`` /
+    ``_bulk_session_liveness`` must consult for ``host_online``.
+    """
+    # Replica A owns the host WebSocket and creates the session.
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # Replica B: same DB, fresh app/registries. It never sees the
+    # host's WebSocket — only the persisted ``hosts`` row.
+    artifact_store_b = LocalArtifactStore(str(tmp_path / "artifacts_b"))
+    app_b = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store_b,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store_b,
+            cache_dir=tmp_path / "cache_b",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+    )
+    assert app_b.state.host_registry.get(_HOST_ID) is None, (
+        "test setup is broken: replica B's host registry should be empty."
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_b),
+        base_url="http://test",
+    ) as client_b:
+        single = await client_b.get(f"/health?session_id={session_id}")
+        batch = await client_b.get(f"/health?session_ids={session_id}")
+
+    assert single.status_code == 200
+    # The runner tunnel is on replica A only, so strict runner_online is
+    # False here — but host_online must be True, read cross-replica from
+    # the hosts DB row rather than replica B's empty local registry.
+    assert single.json()["session"]["host_online"] is True, (
+        "replica B reported the host offline for a host connected to "
+        "replica A — _session_liveness is reading host liveness from the "
+        "local registry instead of the hosts DB."
+    )
+    assert single.json()["session"]["runner_online"] is False
+    assert batch.status_code == 200
+    assert batch.json()["sessions"][session_id]["host_online"] is True, (
+        "replica B reported the host offline in the batch path — "
+        "_bulk_session_liveness is reading host liveness from the local "
+        "registry instead of the hosts DB."
+    )
+    assert batch.json()["sessions"][session_id]["runner_online"] is False
+
+
+async def _serve_fs_requests(
+    comm: ApplicationCommunicator,
+    workspace_root: str,
+    *,
+    max_frames: int = 60,
+) -> None:
+    """Answer the host's ``host.fs_request`` round-trips from a real dir.
+
+    Runs the production :class:`omnigent.workspace_fs.WorkspaceReader`
+    against ``workspace_root`` — a real on-disk directory the test
+    controls — for each fs request the server proxies, replying with the
+    same ``host.fs_result`` shape the real host daemon sends. This is the
+    fake host standing in for a machine that still holds the workspace on
+    disk after its runner died.
+
+    Runs until cancelled; drive it as a background task while issuing the
+    filesystem requests, then cancel it.
+
+    :param comm: The connected host communicator.
+    :param workspace_root: Absolute path to a real directory to read.
+    :param max_frames: Frame budget so a routing bug fails fast.
+    """
+    from pathlib import Path
+
+    from omnigent.host.frames import HostFsRequestFrame, HostFsResultFrame
+    from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+    reader = WorkspaceReader(Path(workspace_root))
+    deadline = Deadline(30.0)
+    for _ in range(max_frames):
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if not isinstance(frame, HostFsRequestFrame):
+            continue
+        params = frame.params or {}
+        try:
+            if frame.op == "list_or_read":
+                payload = reader.list_or_read(
+                    str(params.get("path", "")),
+                    limit=int(params.get("limit", 20)),
+                    after=params.get("after"),
+                    before=params.get("before"),
+                    order=str(params.get("order", "desc")),
+                )
+            elif frame.op == "changes":
+                payload = reader.changes(frame.session_id)
+            elif frame.op == "diff":
+                payload = reader.diff(frame.session_id, str(params.get("path", "")))
+            elif frame.op == "search":
+                payload = reader.search(
+                    str(params.get("q", "")),
+                    include=params.get("include"),
+                    exclude=params.get("exclude"),
+                    limit=int(params.get("limit", 500)),
+                )
+            else:  # pragma: no cover - defensive
+                raise AssertionError(f"unexpected fs op {frame.op!r}")
+        except WorkspaceReaderError as exc:
+            result = HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=exc.status,
+                error_code=exc.code,
+                error=exc.message,
+            )
+        else:
+            result = HostFsResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+
+async def test_offline_runner_serves_file_content_and_changes_from_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path,
+) -> None:
+    """With the runner offline but the host alive, the filesystem panel
+    is served from the host over the tunnel — no runner, no wake-up.
+
+    End-to-end: a real host over the WS tunnel, a real inline-launched
+    session (host_id + a token-bound runner_id that never connects, so
+    resource access raises ``RUNNER_UNAVAILABLE``), and a real git
+    workspace on disk. Asserts that ``/changes``, the file-content read,
+    and ``/diff`` all return host-served data with the same shapes the
+    runner would return — the passive "agent asleep, files from host"
+    experience. Mutation check: drop the host fallback in
+    ``_fs_get_with_host_fallback`` and every request 503s.
+    """
+    import subprocess
+
+    # A real git workspace on disk: committed baseline + a modification,
+    # so git-mode changes/diff have something to report from disk alone.
+    ws = tmp_path / "hostws"
+    ws.mkdir()
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e.com",
+    }
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "hello.txt").write_text("original\n")
+    subprocess.run(["git", "add", "."], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "hello.txt").write_text("changed on disk\n")
+    (ws / "new.txt").write_text("brand new\n")
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # The inline-launched runner never connected, so its RunnerRouter would
+    # raise RUNNER_UNAVAILABLE (the host-fallback trigger). The test client
+    # runs no lifespan, so install a router that reproduces that signal.
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> object:
+            del session_id, conversation
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # The server must fall back to reading the workspace over the still-open
+    # host tunnel.
+    responder = asyncio.create_task(_serve_fs_requests(comm, str(ws)))
+    try:
+        env_id = "default"
+        base = f"/v1/sessions/{session_id}/resources/environments/{env_id}"
+
+        # 1. Changed files: the git working-tree diff, served from disk.
+        changes = await client.get(f"{base}/changes")
+        assert changes.status_code == 200, changes.text
+        by_path = {e["path"]: e for e in changes.json()["data"]}
+        assert by_path["hello.txt"]["status"] == "modified"
+        assert by_path["new.txt"]["status"] == "created"
+
+        # 2. File content: the actual bytes on disk (the bug we fixed —
+        #    an offline runner used to leave this blank).
+        content = await client.get(f"{base}/filesystem/hello.txt")
+        assert content.status_code == 200, content.text
+        body = content.json()
+        assert body["encoding"] == "utf-8"
+        assert body["content"] == "changed on disk\n"
+
+        # 3. Diff: committed baseline vs current on-disk content.
+        diff = await client.get(f"{base}/diff/hello.txt")
+        assert diff.status_code == 200, diff.text
+        assert diff.json()["before"] == "original\n"
+        assert diff.json()["after"] == "changed on disk\n"
+    finally:
+        set_runner_router(prior_router)
+        responder.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+
+async def test_offline_runner_no_host_still_returns_503(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """With the runner offline AND no host connected, the panel 503s.
+
+    The resolver's last link: when neither the runner nor a host can read
+    the workspace, the original runner-offline error surfaces (503) so the
+    client shows its reconnect affordance rather than a blank success.
+    Guards against the fallback masking a genuinely unreachable workspace.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> object:
+            del session_id, conversation
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # Drop the host tunnel so no fallback source remains.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/default/changes"
+        )
+    finally:
+        set_runner_router(prior_router)
+    assert resp.status_code == 503, resp.text
+
+
+async def test_message_relaunch_workspace_missing_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace-missing refusal at relaunch persists user msg + error turn.
+
+    When the session workspace has been deleted on the host (e.g. the
+    worktree was pruned), the host returns ``workspace_missing`` and the
+    runner will never appear. The server must:
+    - NOT wait out the full connect timeout (which would hang every message);
+    - Persist the user message together with a ``workspace_missing``
+      error item carrying the host's actionable "workspace does not exist"
+      message instead of the generic fallback.
+
+    Mutation check: drop the ``_WORKSPACE_MISSING_ERROR_CODE`` branch in
+    ``_ensure_runner_relay_ready`` and the message 503s with
+    ``runner_unavailable`` and no error item is written.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_WORKSPACE_MISSING_ERROR,
+            launch_error_code="workspace_missing",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 202, (
+        f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, (
+        f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
+    )
+    assert error_items[0]["code"] == WORKSPACE_MISSING_ERROR_CODE
+    assert "does not exist" in error_items[0]["message"], (
+        f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
+    )
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id == _HOST_ID
+
+
+async def test_message_relaunch_recreated_workspace_continues_with_notice(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch whose host recreated the deleted workspace is not a refusal.
+
+    The host recreates a missing workspace directory and reports it with
+    ``workspace_recreated`` on its ``launched`` result. The server must treat
+    that as a normal launch — no ``workspace_missing`` error turn, no blocked
+    send — and leave exactly one info-level notice in the transcript so the
+    user learns the directory is now empty.
+
+    No runner connects in this harness, so the send itself ends in the
+    generic never-connected 503; the assertions pin which path the launch
+    took, not the runner outcome.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="launched", workspace_recreated=True)
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    assert msg_resp.json()["error"]["code"] == "runner_unavailable", msg_resp.text
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    error_items = [item for item in items.json()["data"] if item.get("type") == "error"]
+    assert [item["code"] for item in error_items] == ["workspace_recreated"], (
+        f"expected only the recreated-workspace notice, got {error_items!r}"
+    )
+    notice = error_items[0]
+    assert notice.get("level") == "info", f"the notice must not render as a failure: {notice!r}"
+    assert _WORKSPACE in notice["message"], notice["message"]
+
+
+async def test_retry_session_relaunches_dead_runner_without_mutating_history(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry relaunches one dead runner and confirms its recovered lifecycle."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+    before = await client.get(f"/v1/sessions/{session_id}/items")
+    runner_client = object()
+    wait_for_runner_client = AsyncMock(return_value=runner_client)
+    initialize = AsyncMock(return_value=False)
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_runner_client)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+
+    set_runner_client(None)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": True,
+        "recovery": "runner_relaunched",
+    }
+    initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    relay_ready.assert_awaited_once()
+    after = await client.get(f"/v1/sessions/{session_id}/items")
+    assert after.json() == before.json()
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id != original_runner_id
+
+
+async def test_retry_session_single_flight_launches_and_rotates_once(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent retries share one host launch and one binding rotation."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+    runner_client = object()
+
+    async def _runner_connects_after_launch(*args: Any, **kwargs: Any) -> object:
+        del args, kwargs
+        await asyncio.sleep(0.05)
+        return runner_client
+
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects_after_launch)
+    monkeypatch.setattr(
+        routes_events,
+        "_ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        routes_events,
+        "_ensure_runner_relay_ready",
+        AsyncMock(return_value=None),
+    )
+    set_runner_client(None)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    responses = await asyncio.gather(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+        ),
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+        ),
+    )
+    await responder
+
+    expected = {
+        "queued": False,
+        "recovered": True,
+        "recovery": "runner_relaunched",
+    }
+    assert [response.json() for response in responses] == [expected, expected]
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id != original_runner_id
+
+
+async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled recovery is not reused after its only waiter is cancelled."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = "cancelled-retry-waiter"
+    first_started = asyncio.Event()
+    finish_first = asyncio.Event()
+    first_settled = asyncio.Event()
+    attempts = 0
+    first_result = {"queued": False, "recovered": True, "recovery": "first"}
+    second_result = {"queued": False, "recovered": True, "recovery": "second"}
+
+    async def _recover(**kwargs: Any) -> dict[str, bool | str]:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        if attempts == 1:
+            first_started.set()
+            await finish_first.wait()
+            first_settled.set()
+            return first_result
+        return second_result
+
+    monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
+    flight = (session_id, None)
+    routes_events._retry_recovery_tasks.pop(flight, None)
+
+    waiter = asyncio.create_task(
+        routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation=None,
+            conversation_store=None,
+            runner_router=None,
+            user_id=None,
+            permission_store=None,
+        )
+    )
+    await first_started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    finish_first.set()
+    await first_settled.wait()
+    for _ in range(10):
+        if flight not in routes_events._retry_recovery_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert flight not in routes_events._retry_recovery_tasks
+    assert (
+        await routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation=None,
+            conversation_store=None,
+            runner_router=None,
+            user_id=None,
+            permission_store=None,
+        )
+        == second_result
+    )
+    assert attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "expected_status"),
+    [
+        ("workspace_missing", _WORKSPACE_MISSING_ERROR, 410),
+        ("harness_not_configured", _HARNESS_REFUSAL, 412),
+    ],
+)
+async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_message: str,
+    expected_status: int,
+) -> None:
+    """Retry host refusals stay typed and never enter message persistence."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    before = await client.get(f"/v1/sessions/{session_id}/items")
+    set_runner_client(None)
+
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=error_message,
+            launch_error_code=error_code,
+        )
+    )
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["code"] == error_code
+    after = await client.get(f"/v1/sessions/{session_id}/items")
+    assert after.json() == before.json()
+
+
+async def test_relaunch_stops_the_superseded_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch asks the host to stop the runner it just superseded.
+
+    ``replace_runner_id`` unbinds the previous runner but — before this —
+    nothing ever stopped it: the process idled on the host forever (tunnel
+    still authenticating, transcript forwarder still tailing the session),
+    leaking one full runner + native pane per relaunch (#5182).
+
+    Mutation check: drop the ``_spawn_superseded_runner_stop`` call in
+    ``_launch_runner_on_host_locked`` and no stop frame arrives — the
+    stop-frame assertion fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+    )
+    launch_frame: HostLaunchRunnerFrame | None = None
+    stop_frame: HostStopRunnerFrame | None = None
+    try:
+        # The stop is a detached task, so the stop and launch frames can
+        # arrive in either order; collect until both are seen.
+        deadline = Deadline(20.0)
+        for _ in range(40):
+            if launch_frame is not None and stop_frame is not None:
+                break
+            output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frame = frame
+            elif isinstance(frame, HostStopRunnerFrame):
+                stop_frame = frame
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStopRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="stopped",
+                            )
+                        ),
+                    }
+                )
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, "the relaunch itself must still fire"
+    assert stop_frame is not None, (
+        "the relaunch must ask the host to stop the superseded runner; "
+        "without it the old runner process leaks on the host (#5182)"
+    )
+    assert stop_frame.runner_id == original_runner_id, (
+        f"the stop must target the SUPERSEDED runner {original_runner_id!r}, "
+        f"got {stop_frame.runner_id!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
+)
+async def test_concurrent_relaunches_are_single_flight(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_after_rotation: bool,
+) -> None:
+    """Two racing messages to an offline-runner session launch ONE runner.
+
+    Before the per-conversation single-flight, each racing request rotated
+    the binding and spawned its own runner (observed 3 seconds apart in
+    the #5182 incident) — every extra spawn a leaked generation.
+
+    Mutation check: remove the relaunch lock / re-read short-circuit and
+    two launch frames arrive — the exactly-one assertion fails. The host
+    reports ``workspace_recreated`` so the same lock must also leave exactly
+    one recovery notice, never one per rider.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    set_runner_client(None)
+
+    launch_runner = sessions_module._launch_runner_on_host
+    both_callers_ready = asyncio.Event()
+    observed_bindings: list[str | None] = []
+
+    async def _race_launch(*args: Any, **kwargs: Any) -> Any:
+        observed_bindings.append(args[0].runner_id)
+        if len(observed_bindings) == 2:
+            both_callers_ready.set()
+        if not snapshot_after_rotation:
+            await both_callers_ready.wait()
+        return await launch_runner(*args, **kwargs)
+
+    # Race both old snapshots, or let the second caller read the in-flight binding.
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
+
+    def _post() -> Any:
+        return client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+
+    tasks = [asyncio.create_task(_post())]
+    if not snapshot_after_rotation:
+        tasks.append(asyncio.create_task(_post()))
+    launches: list[HostLaunchRunnerFrame] = []
+    try:
+        if not snapshot_after_rotation:
+            await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+            assert observed_bindings == [session["runner_id"], session["runner_id"]]
+        # Collect every frame the host sees inside a bounded window; a
+        # second launch frame (the double-spawn) would arrive well within
+        # it since both requests are already in flight.
+        drain = Deadline(20.0)
+        with contextlib.suppress(asyncio.TimeoutError):
+            for _ in range(40):
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
+                if output["type"] != "websocket.send":
+                    continue
+                frame = decode_host_frame(output["text"])
+                if isinstance(frame, HostLaunchRunnerFrame):
+                    launches.append(frame)
+                    if snapshot_after_rotation and len(launches) == 1:
+                        tasks.append(asyncio.create_task(_post()))
+                        await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+                        assert observed_bindings == [
+                            session["runner_id"],
+                            token_bound_runner_id(frame.binding_token),
+                        ]
+                    # Answer "launched" so the first flight's result wait
+                    # returns and releases the relaunch lock — the second
+                    # flight must then SHORT-CIRCUIT on the rotated binding
+                    # rather than launching again.
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostLaunchRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="launched",
+                                    runner_id="runner_from_host",
+                                    workspace_recreated=True,
+                                )
+                            ),
+                        }
+                    )
+                elif isinstance(frame, HostStopRunnerFrame):
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostStopRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="stopped",
+                                )
+                            ),
+                        }
+                    )
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    assert len(launches) == 1, (
+        f"concurrent relaunches must single-flight into ONE host.launch_runner; "
+        f"got {len(launches)} — each extra spawn is a leaked runner (#5182)"
+    )
+
+    # The one launch recreated the workspace; the notice persists under the
+    # relaunch lock, so the rider must not duplicate it.
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    recreated = [
+        item
+        for item in items.json()["data"]
+        if item.get("type") == "error" and item.get("code") == "workspace_recreated"
+    ]
+    assert len(recreated) == 1, (
+        f"concurrent relaunches must leave exactly one workspace-recreated notice; "
+        f"got {len(recreated)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario", ["replaced", "gone", "denied", "replaced_again", "ack_timeout", "cancelled"]
+)
+async def test_relaunch_recovers_only_a_rejected_enqueue(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """A replacement gets one identical launch, only before enqueue succeeds."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.set_host_id(conv.id, _HOST_ID, workspace=_WORKSPACE)
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
+    registry.launch_authorizer = host_store.admit_launch
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    original = registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None)
+    connections = [original]
+    admissions: list[HostConnection] = []
+    attempted_frames: list[str] = []
+    accepted_frames: list[HostLaunchRunnerFrame] = []
+    pending_futures: list[asyncio.Future[Any]] = []
+    real_admit = registry.admit_launch
+    real_send = registry.send_text
+    real_replace = store.replace_runner_id
+    bound_runner_ids: list[str] = []
+
+    def record_binding(session_id: str, runner_id: str) -> Conversation:
+        bound_runner_ids.append(runner_id)
+        return real_replace(session_id, runner_id)
+
+    async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
+        admissions.append(conn)
+        await real_admit(conn, session_id)
+        if len(admissions) == 1:
+            if scenario == "gone":
+                registry.deregister(_HOST_ID, conn=original)
+            else:
+                connections.append(
+                    registry.register(
+                        _HOST_ID,
+                        _NoopRunnerWS(),
+                        hello,
+                        owner="different-owner@example.test" if scenario == "denied" else None,
+                    )
+                )
+        elif scenario == "replaced_again":
+            connections.append(registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None))
+
+    def send_and_acknowledge(conn: HostConnection, payload: str) -> None:
+        frame = decode_host_frame(payload)
+        assert isinstance(frame, HostLaunchRunnerFrame)
+        attempted_frames.append(payload)
+        pending_futures.append(conn.pending_launches[frame.request_id])
+        real_send(conn, payload)
+        accepted_frames.append(frame)
+        if scenario == "cancelled":
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+        elif scenario != "ack_timeout":
+            conn.pending_launches.pop(frame.request_id).set_result(
+                {"status": "launched", "runner_id": token_bound_runner_id(frame.binding_token)}
+            )
+
+    monkeypatch.setattr(store, "replace_runner_id", record_binding)
+    monkeypatch.setattr(registry, "admit_launch", replace_during_admission)
+    monkeypatch.setattr(registry, "send_text", send_and_acknowledge)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
+
+    async def launch() -> Any:
+        return await sessions_module._launch_runner_on_host(conv, store, registry, original)
+
+    if scenario == "denied":
+        with pytest.raises(OmnigentError) as rejected:
+            await launch()
+        assert rejected.value.code == ErrorCode.UNAUTHORIZED
+    elif scenario == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(launch())
+    else:
+        attempt = await launch()
+        assert attempt.acknowledged is (scenario == "replaced")
+        assert attempt.runner_id == bound_runner_ids[0]
+
+    assert len(bound_runner_ids) == 1
+    assert store.get_conversation(conv.id).runner_id == bound_runner_ids[0]
+    expected_attempts = 1 if scenario in ("gone", "denied") else 2
+    assert len(attempted_frames) == expected_attempts
+    assert len(set(attempted_frames)) == 1
+    assert len(admissions) == (1 if scenario == "gone" else 2)
+    assert admissions == connections[: len(admissions)]
+    assert len(accepted_frames) == (scenario in ("replaced", "ack_timeout", "cancelled"))
+    if accepted_frames:
+        assert token_bound_runner_id(accepted_frames[0].binding_token) == bound_runner_ids[0]
+        assert accepted_frames[0].workspace == _WORKSPACE
+        assert accepted_frames[0].session_id == conv.id
+    assert all(not conn.pending_launches for conn in connections)
+    assert all(future.done() for future in pending_futures)
+
+
+async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both racing messages surface a host refusal, not a generic timeout.
+
+    Single-flight makes the second caller ride the first flight's rotated
+    binding; without the last-attempt memo it would lose the structured
+    ``harness_not_configured`` refusal and dead-end in a connect wait.
+    Both messages must return promptly, and every error turn they leave
+    behind must carry the actionable refusal.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+
+    async def _serve_refusals() -> int:
+        """Answer every launch with a refusal (and ack stops) for a while."""
+        served = 0
+        drain = Deadline(20.0)
+        with contextlib.suppress(asyncio.TimeoutError):
+            for _ in range(40):
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
+                if output["type"] != "websocket.send":
+                    continue
+                frame = decode_host_frame(output["text"])
+                if isinstance(frame, HostLaunchRunnerFrame):
+                    served += 1
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostLaunchRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="failed",
+                                    error=_HARNESS_REFUSAL,
+                                    error_code="harness_not_configured",
+                                )
+                            ),
+                        }
+                    )
+                elif isinstance(frame, HostStopRunnerFrame):
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostStopRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="stopped",
+                                )
+                            ),
+                        }
+                    )
+        return served
+
+    responder = asyncio.create_task(_serve_refusals())
+
+    def _post() -> Any:
+        return client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+
+    # Both must complete promptly (the rider must not dead-end in a 30s
+    # connect wait after losing the refusal). Deliberately unscaled: the bound
+    # only means something below _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S (30s),
+    # which this test does not patch, so scaling it would admit the regression.
+    first, second = await asyncio.wait_for(asyncio.gather(_post(), _post()), timeout=15.0)
+    responder.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await responder
+
+    assert first.status_code in (200, 202), first.text
+    assert second.status_code in (200, 202), second.text
+    # Reaching here at all is the guard: a rider that loses the refusal falls
+    # into the 30s connect wait and the wait_for above fires. What the
+    # transcript must show is that every banner carries the actionable
+    # refusal. A count would instead pin how many messages opened a turn,
+    # which turn scheduling decides, not the rider path.
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i.get("type") == "error"]
+    assert error_items, "the refused relaunch must persist an actionable banner"
+    for item in error_items:
+        assert item["code"] == "harness_not_configured", (
+            f"a racing caller surfaced a non-actionable error instead of the "
+            f"host refusal: {item!r}"
+        )
+        assert "omnigent setup" in item["message"], item
+
+
+# ── Sub-agent children riding the parent's shared runner ─────────────────────
+
+
+class _HostFrameResponder:
+    """Answer host round-trips in the background and record every stop request."""
+
+    def __init__(self, comm: ApplicationCommunicator) -> None:
+        self._comm = comm
+        self.stopped_runner_ids: list[str] = []
+        self.launch_frames: list[HostLaunchRunnerFrame] = []
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> _HostFrameResponder:
+        self._task = asyncio.create_task(self._serve())
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        assert self._task is not None
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await self._task
+
+    async def _serve(self) -> None:
+        while True:
+            output = await self._comm.receive_output(timeout=budget(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                # Keepalive pings interleave with the frames under test.
+                continue
+            if isinstance(frame, HostStatFrame):
+                reply: object = HostStatResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    exists=True,
+                    type="directory",
+                    canonical_path=frame.path,
+                )
+            elif isinstance(frame, HostStopRunnerFrame):
+                self.stopped_runner_ids.append(frame.runner_id)
+                reply = HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                self.launch_frames.append(frame)
+                reply = HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+                )
+            else:
+                continue
+            await self._comm.send_input(
+                {"type": "websocket.receive", "text": encode_host_frame(reply)}
+            )
+
+
+async def _inline_child_session(client: httpx.AsyncClient, parent_id: str) -> dict[str, str]:
+    """Create a sub-agent child on the parent's host; it inherits the parent's runner."""
+    parent = (await client.get(f"/v1/sessions/{parent_id}")).json()
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "host_id": _HOST_ID,
+            "parent_session_id": parent_id,
+            "workspace": _WORKSPACE,
+            "title": "child C",
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    child = create_resp.json()
+    assert child["host_id"] == _HOST_ID
+    assert child["runner_id"] == parent["runner_id"]
+    return {"id": child["id"], "runner_id": child["runner_id"]}
+
+
+async def _drain_detached_stops() -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
+
+
+@pytest.fixture
+def _shared_runner_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[dict[str, str]]:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    set_runner_client(None)
+    ids: dict[str, str] = {}
+    try:
+        yield ids
+    finally:
+        for session_id in ids.values():
+            sessions_module._intentional_stop_sessions.pop(session_id, None)
+            sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_archiving_child_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child's archive must end only the child, not the runner its parent is on."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+
+        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
+    assert parent_row["archived"] is False
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"archiving child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """Clearing the child's runner first does not help once its idle status heals the binding."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    app.state.tunnel_registry.register(parent["runner_id"], _NoopRunnerWS(), _runner_hello())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+
+        async def resolve(sid: str, router: object, **kwargs: Any) -> httpx.AsyncClient | None:
+            conv = kwargs.get("conversation") or store.get_conversation(sid)
+            return runner if conv and app.state.tunnel_registry.get(conv.runner_id) else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        async with _HostFrameResponder(comm) as host:
+            child = await _inline_child_session(client, parent["id"])
+            _shared_runner_family.update(parent=parent["id"], child=child["id"])
+
+            unbind = await client.patch(f"/v1/sessions/{child['id']}", json={"runner_id": ""})
+            assert unbind.status_code == 200, unbind.text
+            assert store.get_conversation(child["id"]).runner_id is None
+            # The child's turn-end status lands after the unbind, as the native forwarder sends it.
+            idle = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            assert idle.status_code in (200, 202), idle.text
+            healed_runner_id = store.get_conversation(child["id"]).runner_id
+            assert healed_runner_id == parent["runner_id"], (
+                "the idle status should heal the binding"
+            )
+
+            archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+            assert archive.status_code == 200, archive.text
+            await _drain_detached_stops()
+
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"unbound child {child['id']} was healed back to runner {healed_runner_id!r}; archiving "
+        f"it asked the host to stop the parent's runner {parent['runner_id']} "
+        f"(stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_stopping_child_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """``stop_session`` on a child ends the child's work, not the parent's runner."""
+    from omnigent.runtime import set_runner_client
+
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+            base_url="http://runner",
+        )
+        set_runner_client(fake_runner)
+        try:
+            stop = await client.post(
+                f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
+            )
+        finally:
+            set_runner_client(None)
+            await fake_runner.aclose()
+        assert stop.status_code in (200, 202), stop.text
+
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"stopping child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_child_relaunch_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child's relaunch must not reap the runner it inherited from its parent."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        await asyncio.gather(
+            *list(sessions_helpers._detached_supersede_stops), return_exceptions=True
+        )
+
+    assert [frame.session_id for frame in host.launch_frames] == [child["id"]], response.text
+    rebound_runner_id = SqlAlchemyConversationStore(db_uri).get_conversation(child["id"]).runner_id
+    assert rebound_runner_id not in (None, parent["runner_id"]), (
+        f"the relaunch should bind child {child['id']} to a runner of its own, "
+        f"got {rebound_runner_id!r}"
+    )
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"relaunching child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_archiving_child_off_the_shared_runner_stops_its_own_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child that moved onto a runner of its own still tears that runner down."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        own_runner_id = token_bound_runner_id("child-own-binding-token")
+        SqlAlchemyConversationStore(db_uri).replace_runner_id(child["id"], own_runner_id)
+
+        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    assert host.stopped_runner_ids == [own_runner_id], (
+        f"archiving child {child['id']} on its own runner {own_runner_id} should stop only "
+        f"that runner (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_archiving_grandchild_on_roots_shared_runner_does_not_stop_it(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A grandchild left on the root's runner after its parent moved on keeps it alive."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        grandchild = await _inline_child_session(client, child["id"])
+        _shared_runner_family.update(
+            parent=parent["id"], child=child["id"], grandchild=grandchild["id"]
+        )
+        SqlAlchemyConversationStore(db_uri).replace_runner_id(
+            child["id"], token_bound_runner_id("child-relaunch-binding-token")
+        )
+
+        archive = await client.patch(f"/v1/sessions/{grandchild['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    assert host.stopped_runner_ids == [], (
+        f"archiving grandchild {grandchild['id']} asked the host to stop "
+        f"{host.stopped_runner_ids}; it still rides the root's runner {parent['runner_id']}"
+    )
+
+
+class _StagedRunners:
+    """Resolve only runners that have connected, and record what each one receives.
+
+    A session resolves a client only while its row is bound to a connected
+    runner. A connect wait marks the awaited runner connected, as when a runner
+    the host relaunched registers its tunnel.
+    """
+
+    def __init__(self, store: SqlAlchemyConversationStore) -> None:
+        self._store = store
+        self.live: set[str] = set()
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(self._handle), base_url="http://runner"
+        )
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            self.posts.append((request.url.path, json.loads(request.content or b"{}")))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    async def get_runner_client(
+        self,
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Conversation | None = None,
+    ) -> httpx.AsyncClient | None:
+        del runner_router, conversation
+        conv = self._store.get_conversation(session_id)
+        return self.client if conv is not None and conv.runner_id in self.live else None
+
+    async def wait_for_runner_client(
+        self,
+        session_id: str,
+        runner_router: object,
+        tunnel_registry: object,
+        *,
+        runner_id: str | None,
+        timeout_s: float,
+        runner_exit_reports: object = None,
+    ) -> httpx.AsyncClient | None:
+        del tunnel_registry, timeout_s, runner_exit_reports
+        if runner_id is not None:
+            self.live.add(runner_id)
+        return await self.get_runner_client(session_id, runner_router)
+
+
+async def _side_chat_with_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> tuple[ApplicationCommunicator, _StagedRunners, dict[str, str], str]:
+    """Create a side chat on its source's runner, then let that runner exit.
+
+    The side chat is bound the way the web binds one: fork with ``side_chat``,
+    then point the fork at the source's live runner. The runner's later exit
+    (for example, its idle timeout) leaves the host connected.
+
+    :param harness: Source agent harness, e.g. ``"claude-native"``; ``None``
+        uses the default test agent.
+    :returns: The host communicator, staged runners, source session
+        (``id`` + ``runner_id``), and the side chat's id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+    )
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor=None if harness is None else {"type": "omnigent", "config": {"harness": harness}},
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert created.status_code == 201, created.text
+    source = {"id": created.json()["id"], "runner_id": created.json()["runner_id"]}
+    runners.live.add(source["runner_id"])
+    fork = await client.post(
+        f"/v1/sessions/{source['id']}/fork", json={"title": "Side chat", "side_chat": True}
+    )
+    assert fork.status_code == 201, fork.text
+    side_chat_id = fork.json()["id"]
+    store.replace_runner_id(side_chat_id, source["runner_id"])
+    runners.live.discard(source["runner_id"])
+    return comm, runners, source, side_chat_id
+
+
+@pytest.mark.parametrize("harness", [None, "claude-native"], ids=["sdk", "claude-native"])
+async def test_side_chat_message_relaunches_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> None:
+    """A side chat whose shared runner exited recovers through its source session.
+
+    The side chat has no host of its own, so the send asks the source's host to
+    relaunch the source, then binds the side chat to that runner and initializes
+    it there before forwarding the message.
+    """
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, harness
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await _post_hello(client, side_chat_id)
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code < 300, response.text
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_chat_after is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_chat_after.runner_id == source_after.runner_id
+    assert side_chat_after.host_id is None
+    paths = [path for path, _ in runners.posts]
+    init = paths.index("/v1/sessions")
+    assert runners.posts[init][1]["session_id"] == side_chat_id
+    assert init < paths.index(f"/v1/sessions/{side_chat_id}/events"), paths
+
+
+@pytest.mark.parametrize("harness", [None, "claude-native"], ids=["sdk", "claude-native"])
+async def test_side_chat_retry_relaunches_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> None:
+    """Resume on a side chat relaunches its source's runner instead of failing."""
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, harness
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await client.post(
+            f"/v1/sessions/{side_chat_id}/events", json={"type": "retry_session", "data": {}}
+        )
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code == 202, response.text
+    assert response.json()["recovery"] == "runner_relaunched", response.json()
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_chat_after is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_chat_after.runner_id == source_after.runner_id
+    assert ("/v1/sessions", side_chat_id) in [
+        (path, body.get("session_id")) for path, body in runners.posts
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error_code", "host_error", "expected_message"),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "harness 'claude-native' is not configured on host 'laptop' — "
+            "run `omnigent setup` on that machine",
+            "harness 'claude-native' is not configured on host 'laptop' — "
+            "run `omnigent setup` on that machine",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            "workspace path does not exist: /work/repo",
+        ),
+    ],
+    ids=["harness-not-configured", "workspace-missing"],
+)
+async def test_side_chat_message_source_refusal_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    host_error: str,
+    expected_message: str,
+) -> None:
+    """A refused source relaunch consumes the side chat's message with the reason.
+
+    The refusal comes from the source's host, but the side chat is the session
+    being messaged: its transcript must carry the same actionable error item
+    the source's own send produces, instead of the generic unavailable error
+    keyed to the side chat's old runner binding. A workspace refusal is rebuilt
+    from the source row, so the host's own text never reaches the transcript.
+    """
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, "claude-native"
+    )
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=host_error,
+            launch_error_code=error_code,
+        )
+    )
+    try:
+        response = await _post_hello(client, side_chat_id)
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code == 202, (
+        f"expected the message to be consumed, got {response.status_code}: {response.text}"
+    )
+    items = await client.get(f"/v1/sessions/{side_chat_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, f"expected one refusal error item, got {error_items!r}"
+    assert error_items[0]["code"] == error_code, error_items[0]
+    assert error_items[0]["message"] == expected_message, error_items[0]
+    assert "SECRET_TOKEN" not in error_items[0]["message"]
+    # The refusal binds the attempted runner to the source (the same
+    # remediation-friendly rebinding the source's own refused relaunch does);
+    # the side chat keeps its old binding to follow the source's next relaunch.
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_after is not None
+    assert source_after.host_id == _HOST_ID
+    assert source_after.runner_id is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_after.runner_id == source["runner_id"]
+
+
+async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat follows a source that already got a new runner, without a launch."""
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, "claude-native"
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    replacement = token_bound_runner_id("replacement-binding")
+    store.replace_runner_id(source["id"], replacement)
+    runners.live.add(replacement)
+    try:
+        response = await _post_hello(client, side_chat_id)
+        launched = await _expect_no_launch(comm, budget_s=budget(0.5))
+    finally:
+        await runners.client.aclose()
+
+    assert response.status_code < 300, response.text
+    assert not launched
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert side_chat_after is not None and side_chat_after.runner_id == replacement
+    assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]

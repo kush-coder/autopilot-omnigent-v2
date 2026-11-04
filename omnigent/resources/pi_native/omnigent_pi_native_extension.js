@@ -1,0 +1,2825 @@
+// Auto-generated Omnigent bridge extension for native Pi sessions.
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+// Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
+//
+// The server's POST /policies/evaluate parks an ASK verdict server-side
+// (URL-based elicitation) and holds the connection open until a human
+// resolves it via the web UI, then returns a hard ALLOW/DENY — the same
+// contract the Claude Code / Codex / Cursor native hooks rely on
+// (omnigent.native_policy_hook.post_evaluate_with_retry, ~1-day client
+// read budget). Node's global fetch (undici) caps a connection that
+// receives no response headers at headersTimeout (~5 min by default), so
+// a long human wait would sever the park mid-flight. We therefore bound
+// each attempt with an AbortController well under that cap and, on the
+// resulting abort (or a transient 5xx / connect error), re-POST the SAME
+// _omnigent_elicitation_id so the server RE-ATTACHES to the existing
+// parked elicitation instead of publishing a second approval card. This
+// mirrors the re-attach idiom in post_evaluate_with_retry while staying
+// resilient to undici's header timeout.
+//
+// _PARK_ATTEMPT_TIMEOUT_MS — per-request abort budget; kept under undici's
+//   ~300s headersTimeout default so a parked request is retried (re-attach)
+//   rather than failing as UND_ERR_HEADERS_TIMEOUT.
+// _PARK_TOTAL_BUDGET_MS — overall ceiling on the park loop. The human-wait
+//   itself is capped server-side by the deciding policy's ask_timeout, so
+//   this is a long backstop that keeps a wedged client from waiting forever.
+const _PARK_ATTEMPT_TIMEOUT_MS = 240_000;
+const _PARK_TOTAL_BUDGET_MS = 86_400_000;
+// Budget for retrying genuinely transient transport errors (connect
+// refused / reset / 5xx) before failing CLOSED. Distinct from the long park
+// budget: a server that is actually down should resolve quickly (fail
+// closed) rather than hang, so the transient-error budget is short.
+const _TRANSIENT_RETRY_BUDGET_MS = 30_000;
+const _TRANSIENT_RETRY_INITIAL_BACKOFF_MS = 1_000;
+const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 10_000;
+// A genuine connect error (refused / reset) throws fast — well under the
+// per-attempt park timeout. A legitimate long-poll abort only throws once
+// our own _PARK_ATTEMPT_TIMEOUT_MS timer fires (the server held the
+// connection open the whole time). We use the attempt's elapsed wall-time
+// to disambiguate the two even when controller.signal.aborted has already
+// flipped true (the abort-timer race): only an attempt that
+// survived to ~the per-attempt timeout is treated as a re-attachable park;
+// anything that failed materially sooner is a genuine transport error and
+// is charged against the transient budget (→ eventually fail CLOSED).
+const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
+// Cap on consecutive raw POLICY_ACTION_ASK rounds that never collapse to a
+// hard verdict. A writable session's ASK is resolved server-side (the gate
+// parks and returns ALLOW/DENY); a *raw* ASK that keeps coming back means the
+// gate cannot be satisfied here (e.g. a read-only caller). Mirror the Python
+// native hook, which fails a stray ASK CLOSED rather than deferring — we cap
+// the rounds and then deny, instead of riding the 24h park ceiling to a
+// fail-open. The brief inter-round sleep means this bounds wall-time too.
+const _MAX_RAW_ASK_ROUNDS = 50;
+
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
+const _ROUTE_TURN_TIMEOUT_MS = 8_000;
+// Reason surfaced when the tool-call gate cannot obtain a usable verdict and
+// fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
+// connector tool, so an unevaluable policy must block, not proceed — matching
+// omnigent.policies.types.FAIL_CLOSED_PHASES and the Python native hook's
+// fail_closed_hook_output(PreToolUse) → deny.
+const _FAIL_CLOSED_REASON =
+  "blocked: Omnigent policy server unreachable — failing closed (PHASE_TOOL_CALL)";
+
+function failClosedVerdict() {
+  return { block: true, reason: _FAIL_CLOSED_REASON };
+}
+
+function mintEvaluateElicitationId() {
+  // Namespaced + 32 lowercase hex chars to satisfy the server's
+  // _EVALUATE_HOOK_ELICITATION_ID_RE (^elicit_evaluate_[0-9a-f]{32}$).
+  return `elicit_evaluate_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    function finish() {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", finish);
+      resolve();
+    }
+    const timer = setTimeout(finish, ms);
+    if (signal) {
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    }
+  });
+}
+
+function readConfig() {
+  const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
+  if (!configPath) return null;
+  try {
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (_err) {
+    return null;
+  }
+}
+
+function nativeAuthFailure(message, ctx) {
+  const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
+  const error = message && message.errorMessage;
+  const provider =
+    (message && message.provider) || (ctx && ctx.model && ctx.model.provider);
+  if (!authDir || typeof provider !== "string" || typeof error !== "string")
+    return null;
+  // Match wrap_auth_command's provider key and Pi's resolver error wording.
+  const id = crypto
+    .createHash("sha256")
+    .update(provider)
+    .digest("hex")
+    .slice(0, 16);
+  const file = `auth-${id}.json`;
+  if (
+    !error.includes("Failed to resolve API key for provider") ||
+    !error.includes(file)
+  )
+    return null;
+  try {
+    const resultPath = path.join(authDir, `${file}.result.json`);
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    const age = Date.now() - result.at;
+    if (
+      result.piPid !== process.pid ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > 30_000
+    )
+      return null;
+    const reasons = {
+      timeout: "timed out before Pi's ten-second deadline",
+      failed_exit: "exited unsuccessfully",
+      empty: "returned an empty token",
+      invalid_output: "returned invalid UTF-8",
+      output_limit: "exceeded the output limit",
+      start_failed: "could not start",
+      invalid_command: "has no command configured",
+      cancelled: "was cancelled",
+    };
+    const reason = reasons[result.kind];
+    if (!reason) return null;
+    fs.unlinkSync(resultPath);
+    return {
+      code: `pi_auth_${result.kind}`,
+      message: `Pi authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+// Re-read authHeaders from config.json on each outbound request. The bearer
+// baked at launch dies with the ~1h Databricks OAuth lifetime; the runner
+// re-mints it into config.json each turn (PiNativeExecutor), so re-reading
+// here keeps the policy/MCP/event POSTs authenticated instead of failing
+// closed mid-session. Falls back to the closed-over headers when the re-read
+// fails (a torn config) so a transient read can't drop auth.
+function freshAuthHeaders(fallback) {
+  const latest = readConfig();
+  if (latest && latest.authHeaders && typeof latest.authHeaders === "object") {
+    return latest.authHeaders;
+  }
+  return fallback || {};
+}
+
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
+function mintPiUiElicitationId() {
+  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+const _UNSUPPORTED_ENDPOINT = Symbol("unsupported endpoint");
+
+// Shared long-poll transport for policy verdicts and extension dialogs.
+async function postParkedJson(config, relayPath, serverPath, payload, {
+  parkDeadline, signal, retryEmpty = false,
+}) {
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}${relayPath}`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}${serverPath}`;
+  const body = JSON.stringify(payload);
+  const requestHeaders = () => relay
+    ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+    : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) };
+
+  let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+  let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+  let emptyResponses = 0;
+
+  while (true) {
+    if (signal && signal.aborted) return null;
+    if (Date.now() >= parkDeadline) return null;
+    const controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const remaining = parkDeadline - Date.now();
+    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
+    const timer = controller
+      ? setTimeout(() => controller.abort(), attemptMs)
+      : null;
+    const callerSignal = signal;
+    const cancelAttempt = () => controller && controller.abort();
+    if (callerSignal) {
+      callerSignal.addEventListener("abort", cancelAttempt, { once: true });
+      if (callerSignal.aborted) cancelAttempt();
+    }
+    const attemptStart = Date.now();
+    let resp;
+    let text;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: requestHeaders(),
+        body,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      text = resp.ok ? await resp.text() : "";
+    } catch (_err) {
+      if ((callerSignal && callerSignal.aborted) || Date.now() >= parkDeadline) return null;
+      if (timer) clearTimeout(timer);
+      const aborted = !!(controller && controller.signal.aborted);
+      const elapsed = Date.now() - attemptStart;
+      const reattachFloor = Math.min(
+        _PARK_REATTACH_MIN_ELAPSED_MS,
+        Math.max(attemptMs - 5_000, attemptMs * 0.8),
+      );
+      const isLongPollReattach = aborted && elapsed >= reattachFloor;
+      if (isLongPollReattach) {
+        if (Date.now() >= parkDeadline) return null;
+        transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+        transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+        continue;
+      }
+      if (Date.now() + transientBackoff >= transientDeadline) return null;
+      await sleep(transientBackoff, signal);
+      transientBackoff = Math.min(
+        transientBackoff * 2,
+        _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+      );
+      continue;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener("abort", cancelAttempt);
+    }
+    if (callerSignal && callerSignal.aborted) return null;
+
+    if (!resp.ok) {
+      if (resp.status === 404 || resp.status === 405) return _UNSUPPORTED_ENDPOINT;
+      if (resp.status >= 500) {
+        if (Date.now() + transientBackoff >= transientDeadline) return null;
+        await sleep(transientBackoff, signal);
+        transientBackoff = Math.min(
+          transientBackoff * 2,
+          _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+        );
+        continue;
+      }
+      return null;
+    }
+
+    if (!text && retryEmpty) {
+      // Bound empty proxy responses; explicit server cancellation never re-parks.
+      if (++emptyResponses >= 3 || Date.now() >= parkDeadline) return null;
+      transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+      transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+      // A server that answers immediately (consumed tombstone, a proxy that
+      // ends the long poll) would otherwise spin here with no delay.
+      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, signal);
+      continue;
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    return json && typeof json === "object" ? json : null;
+  }
+}
+
+async function parkPiExtensionUiHttp(config, request, opts = {}) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const timeoutMs = opts && typeof opts.timeout === "number" && opts.timeout > 0
+    ? opts.timeout : _PARK_TOTAL_BUDGET_MS;
+  return postParkedJson(config, "/hook/pi/extension-ui", "/hooks/pi-extension-ui", {
+    elicitation_id: mintPiUiElicitationId(),
+    request: { ...request, timeout: timeoutMs },
+  }, {
+    parkDeadline: Date.now() + timeoutMs,
+    signal: opts && opts.signal,
+    retryEmpty: true,
+  });
+}
+
+function extensionUiValue(response) {
+  return response && !response.cancelled && typeof response.value === "string"
+    ? response.value : undefined;
+}
+
+function wrapExtensionUi(ctx, config) {
+  if (!ctx || ctx.mode !== "tui" || !ctx.ui || ctx.ui.__omnigentUiWrapped) {
+    return;
+  }
+  const ui = ctx.ui;
+  ui.__omnigentUiWrapped = true;
+  const original = Object.fromEntries(
+    ["confirm", "select", "input", "editor"]
+      .filter((method) => typeof ui[method] === "function")
+      .map((method) => [method, ui[method].bind(ui)]),
+  );
+
+  if (original.confirm) ui.confirm = async (title, message, opts) => {
+    const request = { method: "confirm", title, message };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.confirm(title, message, opts);
+    return !!(verdict && verdict.confirmed === true);
+  };
+  if (original.select) ui.select = async (title, options, opts) => {
+    const request = {
+      method: "select",
+      title,
+      options: Array.isArray(options) ? options : [],
+    };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.select(title, options, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.input) ui.input = async (title, placeholder, opts) => {
+    const request = { method: "input", title, placeholder };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.input(title, placeholder, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.editor) ui.editor = async (title, prefill, opts) => {
+    const request = { method: "editor", title, prefill };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.editor(title, prefill, opts);
+    return extensionUiValue(verdict);
+  };
+}
+
+// A missing verdict blocks native tools; declining an ordinary dialog does not.
+async function evalNativePolicyHttp(config, toolName, args) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const payload = {
+    event: {
+      type: "PHASE_TOOL_CALL",
+      target: "",
+      data: { name: toolName, arguments: args },
+      context: {},
+    },
+    _omnigent_elicitation_id: mintEvaluateElicitationId(),
+  };
+  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
+  for (let round = 0; round < _MAX_RAW_ASK_ROUNDS; round += 1) {
+    const json = await postParkedJson(config, "/policies/evaluate", "/policies/evaluate", payload, {
+      parkDeadline,
+    });
+    if (!json || json === _UNSUPPORTED_ENDPOINT) return failClosedVerdict();
+    if (json.result === "POLICY_ACTION_DENY") {
+      return { block: true, reason: json.reason || "blocked by Omnigent policy" };
+    }
+    if (json.result !== "POLICY_ACTION_ASK") return { block: false, reason: "" };
+    if (round + 1 < _MAX_RAW_ASK_ROUNDS) await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+  }
+  return failClosedVerdict();
+}
+
+/**
+ * Build a Pi tool-result object from an MCP ``tools/call`` JSON-RPC response.
+ *
+ * Pi expects ``{ content: [{ type: "text", text }], isError }``. The Omnigent
+ * MCP proxy returns a JSON-RPC envelope whose ``result`` carries an MCP
+ * content array (``[{ type: "text", text }]``) on success, or a JSON-RPC
+ * ``error`` object (with the MCP convention code -32000 for tool denials /
+ * tool errors) on failure. Map both into a single text block so the Pi agent
+ * can read the output — denials surface as a readable error rather than
+ * wedging the loop.
+ */
+function piResultFromMcpResponse(json) {
+  if (json && typeof json === "object" && json.error) {
+    const msg =
+      (json.error && json.error.message) || "Omnigent tool call failed";
+    return { content: [{ type: "text", text: String(msg) }], isError: true };
+  }
+  const result = json && typeof json === "object" ? json.result : undefined;
+  // An ``input_required`` envelope must never reach this mapper: it carries no
+  // ``content`` array, so it would otherwise fall to the "unexpected shape"
+  // branch and be returned as ``isError: false`` — a confusing elicitation blob
+  // masquerading as a successful tool result. callOmnigentTool detects and
+  // resolves the ASK round-trip BEFORE calling this; treat a stray one as a
+  // fail-closed error so an unresolved approval never reports success.
+  if (
+    result &&
+    typeof result === "object" &&
+    result.resultType === "input_required"
+  ) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval that was not resolved",
+        },
+      ],
+      isError: true,
+    };
+  }
+  if (result && Array.isArray(result.content)) {
+    const parts = [];
+    for (const block of result.content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        typeof block.text === "string"
+      ) {
+        parts.push(block.text);
+      }
+    }
+    const text = parts.join("\n");
+    return {
+      content: [{ type: "text", text: text || safeJsonStringify(result) }],
+      isError: result.isError === true,
+    };
+  }
+  // Unexpected shape: hand the raw result back so nothing is silently dropped.
+  return {
+    content: [{ type: "text", text: safeJsonStringify(result ?? json ?? {}) }],
+    isError: false,
+  };
+}
+
+/**
+ * Extract the elicitation id + opaque requestState from an MCP
+ * ``input_required`` (MRTR) envelope, or ``null`` when the response is not an
+ * ``input_required`` result.
+ *
+ * The Omnigent server keys ``inputRequests`` by the server-minted elicitation
+ * id (the MRTR spec lets the client read those keys; only ``requestState`` is
+ * opaque), so the first key is the id the retry must echo back inside
+ * ``inputResponses``.
+ */
+function mcpInputRequired(json) {
+  const result = json && typeof json === "object" ? json.result : undefined;
+  if (
+    !result ||
+    typeof result !== "object" ||
+    result.resultType !== "input_required"
+  ) {
+    return null;
+  }
+  const inputRequests =
+    result.inputRequests && typeof result.inputRequests === "object"
+      ? result.inputRequests
+      : {};
+  const elicitationId = Object.keys(inputRequests)[0] || "";
+  const requestState =
+    typeof result.requestState === "string" ? result.requestState : "";
+  return { elicitationId, requestState };
+}
+
+/**
+ * Bounded classification for a 2xx ``/mcp`` reply that is not an MCP JSON body.
+ *
+ * ``resp.ok`` is not proof of a JSON answer: an authenticating edge (reverse
+ * proxy, IdP) in front of the server can answer any route with a sign-in
+ * document and status 200. The text names the classification only — never the
+ * body, headers, or URL — because a sign-in document routinely carries tokens
+ * and tenant identifiers.
+ */
+function nonJsonMcpPiResult() {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          "Omnigent tool call failed: the server answered 2xx with a non-JSON " +
+          "body, which usually means an authenticating proxy or sign-in page " +
+          "answered instead of Omnigent. Re-authenticate and retry.",
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * False when ``resp`` declares a content type that is not JSON.
+ *
+ * A declared ``text/html`` (the sign-in case) is rejected. An absent or
+ * unreadable content type is not treated as a signal, so the parse attempt
+ * stays the decider there.
+ */
+function mcpContentTypeIsJson(resp) {
+  let declared = null;
+  try {
+    // Both the property read and the lookup are inside the try: a `headers`
+    // getter can throw just as `get()` can.
+    const headers = resp && resp.headers;
+    if (headers && typeof headers.get === "function") {
+      declared = headers.get("content-type");
+    }
+  } catch (_headerErr) {
+    // An unreadable header is not a signal, so fall through to the parse.
+    // Swallow it here: letting it reach the outer catch would put its message —
+    // which can quote header or body text — into the tool result.
+    return true;
+  }
+  if (typeof declared !== "string" || declared.trim() === "") return true;
+  return /^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(declared.trim());
+}
+
+/**
+ * POST a single JSON-RPC ``tools/call`` to the server's per-session MCP proxy
+ * and return the parsed response (or a fail-closed Pi tool-result on a
+ * transport/HTTP error). ``extraParams`` carries the MRTR retry fields
+ * (``requestState`` + ``inputResponses``) on the approval retry; it is omitted
+ * on the initial call.
+ *
+ * @returns {Promise<{json: object} | {piResult: object}>} ``json`` on a parsed
+ *   200 response; ``piResult`` is a terminal fail-closed tool result the caller
+ *   returns as-is.
+ */
+async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: rpcId,
+    method: "tools/call",
+    params: { name: toolName, arguments: args || {}, ...(extraParams || {}) },
+  });
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      },
+      body,
+    });
+    if (!resp.ok) {
+      return {
+        piResult: {
+          content: [
+            {
+              type: "text",
+              text: `Omnigent tool call failed: HTTP ${resp.status}`,
+            },
+          ],
+          isError: true,
+        },
+      };
+    }
+    // Status, content type, and parseability must all agree before this body is
+    // treated as an MCP response. A parse failure is classified here rather
+    // than by the outer catch, whose message would echo the offending body back
+    // through ``err.message``.
+    if (!mcpContentTypeIsJson(resp)) return { piResult: nonJsonMcpPiResult() };
+    try {
+      return { json: await resp.json() };
+    } catch (_parseErr) {
+      return { piResult: nonJsonMcpPiResult() };
+    }
+  } catch (err) {
+    return {
+      piResult: {
+        content: [
+          {
+            type: "text",
+            text: `Omnigent tool call failed: ${err && err.message ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      },
+    };
+  }
+}
+
+/**
+ * Execute an Omnigent tool by POSTing a JSON-RPC ``tools/call`` request to the
+ * server's per-session MCP proxy endpoint
+ * (``POST /v1/sessions/{sessionId}/mcp``).
+ *
+ * This is the SAME endpoint the runner's ``ProxyMcpManager`` uses: the Omnigent
+ * server evaluates TOOL_CALL / TOOL_RESULT policy and then forwards execution
+ * to the runner's ``/mcp/execute`` (which dispatches the real ``sys_*`` tool on
+ * the correct machine with the session's terminal/workspace). The extension
+ * already carries ``serverUrl`` + ``sessionId`` + ``authHeaders`` in its config,
+ * so no extra relay process is needed.
+ *
+ * **ASK policy / elicitation round-trip (MRTR).** When the tool is gated by an
+ * ASK policy the proxy returns HTTP 200 with an ``input_required`` result
+ * (``{resultType, inputRequests, requestState}``) instead of executing. We must
+ * NOT hand that envelope to the model as a result — it neither prompts nor runs
+ * the tool. Mirroring ``ProxyMcpManager.dispatch()``, we resolve the human
+ * verdict and retry once with the decision in ``inputResponses``:
+ *   1. Long-poll ``POST /policies/evaluate`` via ``evalNativePolicyHttp`` — the
+ *      SAME server-side ASK park the non-bridged hook uses. It holds the
+ *      connection until a human resolves the approval card and collapses to a
+ *      hard ALLOW / DENY (the extension has no in-process approval Future like
+ *      the runner, so the long-poll IS its park/resolve mechanism).
+ *   2. Retry the ``tools/call`` ONCE with ``requestState`` + ``inputResponses:
+ *      {elicitationId: {action: "accept" | "decline"}}``. The server re-evaluates
+ *      TOOL_CALL policy on the retry (it does not trust the client's claim
+ *      blindly), so a still-denied tool stays denied.
+ *   3. Cap at one retry; fail CLOSED (``isError: true``, readable message) if the
+ *      approval cannot be resolved or the proxy still asks after the retry.
+ *
+ * (Trade-off: the proxy's ASK already published one approval card, and the
+ * evaluate long-poll publishes a second one — the extension cannot re-attach to
+ * the proxy-minted elicitation, whose id is in a different namespace. The human
+ * resolves the evaluate card to drive the verdict; the proxy card is orphaned.
+ * This is a UX wrinkle, not a security gap: the tool only runs on a genuine
+ * human accept, and the server re-checks policy on the retry.)
+ *
+ * Fail-safe: any transport/parse error resolves to a readable tool-result error
+ * (``isError: true``) rather than throwing, so a server hiccup never wedges Pi's
+ * agent loop.
+ */
+async function callOmnigentTool(config, toolName, args) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  ) {
+    return {
+      content: [
+        { type: "text", text: "Omnigent tool bridge is not configured" },
+      ],
+      isError: true,
+    };
+  }
+
+  const first = await postMcpToolsCall(config, toolName, args, 1);
+  if (first.piResult) return first.piResult;
+  const initial = mcpInputRequired(first.json);
+  if (initial === null) {
+    // ALLOW / DENY / executed — map directly to a Pi tool result.
+    return piResultFromMcpResponse(first.json);
+  }
+
+  // ── ASK: resolve the human verdict, then retry once (MRTR) ──────────
+  if (!initial.elicitationId || !initial.requestState) {
+    // Malformed input_required — cannot retry. Fail CLOSED.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval but the server sent no resolvable elicitation",
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
+  if (verdict === null) {
+    // The approval gate is structurally unavailable (no server/session/fetch,
+    // or a transport error) — fail CLOSED rather than report false success.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call requires approval but the policy server was unreachable",
+        },
+      ],
+      isError: true,
+    };
+  }
+  const action = verdict.block ? "decline" : "accept";
+
+  const retry = await postMcpToolsCall(config, toolName, args, 2, {
+    requestState: initial.requestState,
+    inputResponses: { [initial.elicitationId]: { action } },
+  });
+  if (retry.piResult) return retry.piResult;
+  if (mcpInputRequired(retry.json) !== null) {
+    // The proxy asked again after one approval round — do NOT loop. Fail CLOSED.
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Omnigent tool call still requires approval after one round — not retrying",
+        },
+      ],
+      isError: true,
+    };
+  }
+  return piResultFromMcpResponse(retry.json);
+}
+
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    // OpenAI o-series / gpt-oss models return content as an array with typed
+    // blocks: {type:"text",text:"..."} and {type:"reasoning",summary:[...]}.
+    // Only collect text blocks; skip reasoning/summary blocks.
+    if (block.type === "reasoning") continue;
+    const text =
+      block.text || block.input_text || block.output_text || block.content;
+    if (typeof text === "string") parts.push(text);
+  }
+  return parts.join("");
+}
+
+function textFromMessage(message) {
+  if (!message || typeof message !== "object") return "";
+  return textFromContent(
+    message.content || message.parts || message.message || "",
+  );
+}
+
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value ?? {});
+  } catch (_err) {
+    return String(value);
+  }
+}
+
+function textFromToolResult(event) {
+  if (!event || typeof event !== "object") return "";
+  const text = textFromContent(event.content);
+  if (text) return text;
+  if ("result" in event) {
+    const result = event.result;
+    if (typeof result === "string") return result;
+    if (result && typeof result === "object") {
+      const resultText = textFromContent(result.content);
+      if (resultText) return resultText;
+    }
+    return safeJsonStringify(result);
+  }
+  if ("details" in event) return safeJsonStringify(event.details);
+  return "";
+}
+
+function contentBlocks(message) {
+  if (
+    !message ||
+    typeof message !== "object" ||
+    !Array.isArray(message.content)
+  )
+    return [];
+  return message.content;
+}
+
+// Pi's convertToLlm renders these messages as user text.
+const _PI_COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:" +
+  "\n\n<summary>\n";
+const _PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+const _PI_BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const _PI_BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+function bashExecutionText(message) {
+  let text = `Ran \`${message.command}\`\n`;
+  text += message.output ? `\`\`\`\n${message.output}\n\`\`\`` : "(no output)";
+  if (message.cancelled) text += "\n\n(command cancelled)";
+  else if (message.exitCode !== null && message.exitCode !== undefined && message.exitCode !== 0)
+    text += `\n\nCommand exited with code ${message.exitCode}`;
+  if (message.truncated && message.fullOutputPath)
+    text += `\n\n[Output truncated. Full output: ${message.fullOutputPath}]`;
+  return text;
+}
+
+// Pi's model context in the item shapes forwarded live, so any harness can replay it.
+// Like live forwarding, it keeps text only: images and tool-result error flags are dropped.
+function compactionSnapshotItems(messages) {
+  const items = [];
+  const addUserText = (text) => {
+    if (!text) return;
+    items.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+  };
+  for (const message of messages) {
+    switch (message?.role) {
+      case "compactionSummary":
+        addUserText(
+          _PI_COMPACTION_SUMMARY_PREFIX + message.summary + _PI_COMPACTION_SUMMARY_SUFFIX,
+        );
+        break;
+      case "branchSummary":
+        addUserText(_PI_BRANCH_SUMMARY_PREFIX + message.summary + _PI_BRANCH_SUMMARY_SUFFIX);
+        break;
+      case "bashExecution":
+        // `!!` shell output never reaches the model.
+        if (!message.excludeFromContext) addUserText(bashExecutionText(message));
+        break;
+      case "user":
+      case "custom":
+        addUserText(textFromMessage(message));
+        break;
+      case "assistant": {
+        const text = textFromMessage(message);
+        if (text) {
+          items.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text }],
+          });
+        }
+        for (const block of contentBlocks(message)) {
+          if (block?.type !== "toolCall" || !block.id || !block.name) continue;
+          items.push({
+            type: "function_call",
+            call_id: String(block.id),
+            name: String(block.name),
+            arguments: safeJsonStringify(block.arguments ?? {}),
+          });
+        }
+        break;
+      }
+      case "toolResult":
+        if (message.toolCallId) {
+          items.push({
+            type: "function_call_output",
+            call_id: String(message.toolCallId),
+            output: textFromToolResult(message),
+          });
+        }
+        break;
+    }
+  }
+  return items;
+}
+
+function fingerprint(text) {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+  }
+  return `${text.length}-${hash.toString(36)}`;
+}
+
+function messageRole(message) {
+  if (!message || typeof message !== "object") return "";
+  return String(message.role || message.type || "");
+}
+
+function toInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+/**
+ * Lift token usage out of one Pi assistant message.
+ *
+ * Mirrors the non-native executor's ``_extract_pi_turn_usage``
+ * (omnigent/inner/pi_executor.py): Pi (``@earendil-works/pi-coding-agent``)
+ * carries a per-message ``usage`` object with ``input`` / ``output`` /
+ * ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` counts, and the message
+ * carries the resolved ``model``. Pi's ``input`` is the NON-cached input
+ * (Anthropic semantics) — ``cacheRead`` / ``cacheWrite`` are separate, so the
+ * full input a turn sent is ``input + cacheRead + cacheWrite``.
+ *
+ * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
+ *   total:number,cost:(number|null),model:(string|null)}|null} the per-message counts, or
+ *   ``null`` when ``message`` is not an assistant message carrying usage.
+ */
+function extractPiUsage(message) {
+  if (!message || typeof message !== "object") return null;
+  if (message.role !== "assistant") return null;
+  const usage = message.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const input = toInt(usage.input);
+  const output = toInt(usage.output);
+  const cacheRead = toInt(usage.cacheRead);
+  const cacheWrite = toInt(usage.cacheWrite);
+  // No countable tokens means Pi emitted an empty usage object — treat as "no
+  // usage" so the server leaves the session unpriced rather than recording a
+  // $0.00 turn (matches _aggregate_pi_turn_usage's empty-usage guard).
+  if (!(input || output || cacheRead || cacheWrite)) return null;
+  const rawModel = message.model;
+  const model = typeof rawModel === "string" && rawModel ? rawModel : null;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    total: toInt(usage.totalTokens),
+    // Pi also uses zero when its model has no price; let the server price that.
+    cost: validCost(usage.cost?.total) > 0 ? usage.cost.total : null,
+    model,
+  };
+}
+
+function validCost(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function headers(config) {
+  return {
+    "content-type": "application/json",
+    ...freshAuthHeaders(config.authHeaders),
+  };
+}
+
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 5;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 1_000;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
+const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
+function settledWithinBudget(settled) {
+  let timeout;
+  return Promise.race([
+    settled.then(() => true),
+    new Promise(resolve => {
+      timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
+
+function boundedSourceId(sourceId) {
+  const value = typeof sourceId === "string" ? sourceId.trim() : "";
+  if (!value) throw new Error("assistant conversation item requires source_id");
+  if (value.length <= 256) return value;
+  return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function eventPostError(response) {
+  const status = response && response.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
+  }
+  return new Error("Omnigent event POST returned an invalid response");
+}
+
+async function postEventChecked(config, body, signal) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  )
+    return;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const request = {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify(body),
+  };
+  if (signal) request.signal = signal;
+  const response = await fetch(url, request);
+  const status = response && response.status;
+  if (
+    !response ||
+    (typeof status === "number" &&
+      (!Number.isFinite(status) || status < 200 || status >= 300)) ||
+    (typeof status !== "number" && response.ok !== true)
+  ) {
+    throw eventPostError(response);
+  }
+  return response;
+}
+
+async function postEvent(config, body, signal) {
+  try {
+    await postEventChecked(config, body, signal);
+  } catch (_err) {
+    // Keep Pi responsive even if Omnigent is temporarily unavailable.
+  }
+}
+
+function isRetryableAssistantError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
+}
+
+// History and completion delivery share bounded retries.
+async function postEventWithRetry(config, body, signal, readReceipt = false) {
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.min(assistantItemPostTimeoutMs(config), remaining),
+    );
+    try {
+      const response = await postEventChecked(
+        config,
+        body,
+        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+      );
+      if (!readReceipt) return response;
+      try {
+        // Receipt reads share the POST timeout; an accepted write is never retried.
+        return await response?.json?.();
+      } catch (_err) {
+        return;
+      }
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError) ||
+      Date.now() + backoff >= deadline
+    )
+      break;
+    signal?.throwIfAborted();
+    await sleep(backoff, signal);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
+  }
+  throw lastError || new Error(`${body.type} POST failed`);
+}
+
+// Bound retained payloads as well as item count while the server is unavailable.
+const _HISTORY_QUEUE_MAX_ITEMS = 256;
+const _HISTORY_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const _HISTORY_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+function createHistoryQueue(config) {
+  const pending = new Map();
+  const controller = new AbortController();
+  let queuedBytes = 0;
+  let worker = null;
+  let closed = false;
+  let lastItemId = null;
+
+  async function deliver(item) {
+    if (item.accepted) return;
+    if (item.data.item_type === "compaction") {
+      item.data.item_data.last_item_id ||= lastItemId || `compact_boundary_${config.sessionId}`;
+    }
+    const receipt = await postEventWithRetry(config, {
+      type: "external_conversation_item",
+      data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
+    }, controller.signal, true);
+    lastItemId = typeof receipt?.item_id === "string" ? receipt.item_id : null;
+    item.accepted = true;
+    item.onAccepted?.();
+  }
+
+  async function drain() {
+    for (const [sourceId, item] of pending) {
+      if (controller.signal.aborted) break;
+      try {
+        // A result cannot overtake a call whose earlier delivery exhausted retries.
+        if (item.dependency) await deliver(item.dependency);
+        await deliver(item);
+      } catch (error) {
+        console.error(`[pi-native] Failed to persist ${item.data.item_type} (${sourceId}):`, error);
+        try {
+          item.onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+      } finally {
+        pending.delete(sourceId);
+        queuedBytes -= item.bytes;
+        item.settle();
+      }
+    }
+    if (pending.size) {
+      console.error(`[pi-native] Discarding ${pending.size} history items at shutdown`);
+      pending.clear();
+      queuedBytes = 0;
+    }
+  }
+
+  function start() {
+    worker = drain().finally(() => {
+      worker = null;
+      if (pending.size) start();
+    });
+  }
+
+  return {
+    enqueue(data, sourceId, { onAccepted, dependency, onFailure, previous } = {}) {
+      const existing = pending.get(sourceId);
+      if (existing) return existing;
+      const bytes = previous?.bytes ??
+        (Buffer.byteLength(JSON.stringify(data)) + (dependency?.bytes || 0));
+      if (
+        closed || pending.size >= _HISTORY_QUEUE_MAX_ITEMS ||
+        queuedBytes + bytes > _HISTORY_QUEUE_MAX_BYTES
+      ) {
+        const error = new Error(`History queue ${closed ? "closed" : "full"}: ${data.item_type}`);
+        console.error("[pi-native]", error);
+        try {
+          onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+        return null;
+      }
+      const item = previous || {
+        data, sourceId, onAccepted, dependency, onFailure, bytes, accepted: false,
+      };
+      item.settled = new Promise(resolve => { item.settle = resolve; });
+      pending.set(sourceId, item);
+      queuedBytes += bytes;
+      if (!worker) start();
+      return item;
+    },
+    async flush() {
+      // Later prompts must not extend the ending turn's delivery barrier.
+      return settledWithinBudget(Promise.all([...pending.values()].map(item => item.settled)));
+    },
+    async close() {
+      closed = true;
+      const timeout = setTimeout(() => controller.abort(), _HISTORY_SHUTDOWN_TIMEOUT_MS);
+      try {
+        while (worker) await worker;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  };
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
+}
+
+async function patchExternalSessionId(config, nativeSessionId) {
+  if (
+    !nativeSessionId ||
+    !config ||
+    !config.serverUrl ||
+    typeof fetch !== "function"
+  )
+    return;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}`;
+  try {
+    await fetch(url, {
+      method: "PATCH",
+      headers: headers(config),
+      body: JSON.stringify({ external_session_id: nativeSessionId }),
+    });
+  } catch (_err) {}
+}
+
+function setOmnigentStatus(config, ctx, state) {
+  if (!ctx || !ctx.ui || !config) return;
+  const urlLabel = config.conversationUrl
+    ? `Omnigent: ${config.conversationUrl}`
+    : "Omnigent";
+  const label = state ? `${urlLabel} · ${state}` : urlLabel;
+  try {
+    ctx.ui.setTitle(`Omnigent: ${config.sessionId}`);
+    ctx.ui.setStatus("omnigent", label);
+    ctx.ui.setStatus("omnigent_state", undefined);
+  } catch (_err) {}
+}
+
+function interruptActiveContext(ctx) {
+  if (!ctx || typeof ctx.abort !== "function") return false;
+  try {
+    ctx.abort();
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+/** Run Pi compaction through its callback API, publishing ordered progress events. */
+async function triggerCompaction(config, ctx, customInstructions) {
+  if (!ctx || typeof ctx.compact !== "function") {
+    await postEvent(config, {
+      type: "external_conversation_item",
+      data: {
+        response_id: `pi-compact-unavailable-${Date.now()}`,
+        item_type: "error",
+        item_data: {
+          source: "execution",
+          code: "pi_compact_unavailable",
+          message:
+            "Omnigent: /compact is unavailable for this Pi session. The " +
+            "resident Pi context exposes no compaction API, so the model or " +
+            "Pi version may not support it.",
+        },
+      },
+    });
+    return false;
+  }
+  try {
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "in_progress" },
+    });
+    await new Promise((resolve, reject) => {
+      ctx.compact({
+        onComplete: resolve,
+        onError: reject,
+        ...(typeof customInstructions === "string" && customInstructions.trim()
+          ? { customInstructions }
+          : {}),
+      });
+    });
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "completed" },
+    });
+    return true;
+  } catch (_err) {
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "failed" },
+    });
+    return false;
+  }
+}
+
+/**
+ * Apply a web-picked model switch to the resident Pi process.
+ *
+ * Pi owns the active model inside this TUI process, so a model picked in the
+ * Omnigent web UI must be applied here (the ``--model`` launch arg is baked in
+ * at spawn). Resolves *modelId* against the session's ``modelRegistry`` (the
+ * same catalog Pi's own ``/model`` picker uses, sourced from the generated
+ * models.json) and calls Pi's ``setModel`` — immediate, no ``/reload``.
+ *
+ * Outcomes (mirrors triggerCompaction's visible-error contract so a web pick
+ * never silently vanishes — the runner already returned 204, so there is no
+ * server-side fallback):
+ *   - No resident context / registry: post an error item, return false.
+ *   - Model id not in the registry: post an error item, return false.
+ *   - setModel returned false (no API key for the model): post an error item,
+ *     return false.
+ *   - Applied: return true. The paired ``model_select`` handler mirrors the
+ *     resulting model back to Omnigent, so the web pill reflects the switch.
+ */
+const inferenceProviderIds = new Set([
+  "omnigent",
+  "omnigent-openai",
+  "omnigent-completions",
+]);
+
+function hasInferenceBinding() {
+  return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
+}
+
+async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
+  const id = typeof modelId === "string" ? modelId.trim() : "";
+  if (!id) return false;
+  const registry = ctx ? ctx.modelRegistry : undefined;
+  // Resolve against whichever listing method exists. Accept EITHER getAll or
+  // getAvailable so the resolve path can never be narrower than the picker's:
+  // postModelOptions lists from getAvailable(), so gating apply on getAll alone
+  // would fail every switch on a hypothetical Pi build exposing only
+  // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
+  // prefer it to resolve; fall back to getAvailable when getAll is absent.
+  const listModels =
+    registry && typeof registry.getAll === "function"
+      ? () => registry.getAll()
+      : registry && typeof registry.getAvailable === "function"
+        ? () => registry.getAvailable()
+        : null;
+  if (!pi || typeof pi.setModel !== "function" || !listModels) {
+    await postModelChangeError(
+      config,
+      `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
+        "no model-switch API (the model or Pi version may not support it).",
+    );
+    return false;
+  }
+  let model;
+  try {
+    const models = listModels().filter(
+      (candidate) =>
+        !hasInferenceBinding() ||
+        (candidate && inferenceProviderIds.has(candidate.provider)),
+    );
+    const separator = id.indexOf("/");
+    if (hasInferenceBinding()) {
+      // Profile IDs are literal, including slashes that resemble Pi providers.
+      model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && separator > 0 && inferenceProviderIds.has(id.slice(0, separator))) {
+        model = models.find(
+          (candidate) =>
+            candidate &&
+            candidate.provider === id.slice(0, separator) &&
+            candidate.id === id.slice(separator + 1),
+        );
+      }
+    } else if (separator > 0) {
+      const provider = id.slice(0, separator);
+      const bareId = id.slice(separator + 1);
+      model = models.find(
+        (candidate) =>
+          candidate && candidate.id === bareId && candidate.provider === provider,
+      );
+      if (!model) model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && registry && typeof registry.find === "function") {
+        model = registry.find(provider, bareId);
+      }
+      if (!model) {
+        model = models.find(
+          (candidate) => candidate && candidate.id === bareId && !candidate.provider,
+        );
+      }
+    } else {
+      model = models.find((candidate) => candidate && candidate.id === id);
+    }
+  } catch (_err) {
+    model = undefined;
+  }
+  if (!model) {
+    await postModelChangeError(
+      config,
+      `Omnigent: model "${id}" is not available in this Pi session.`,
+    );
+    return false;
+  }
+  try {
+    const applied = await pi.setModel(model);
+    if (applied === false) {
+      await postModelChangeError(
+        config,
+        `Omnigent: could not switch to model "${id}" — no API key is ` +
+          "configured for it.",
+      );
+      return false;
+    }
+    // setModel restores Pi defaults; apply the composer's effort afterward.
+    if (typeof thinkingLevel === "string") {
+      await pi.setThinkingLevel(thinkingLevel);
+    }
+    return true;
+  } catch (_err) {
+    await postModelChangeError(
+      config,
+      `Omnigent: switching to model "${id}" failed inside Pi.`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
+ * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
+ */
+async function routeTurn(config, prompt, model) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function")
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/route-turn`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+async function postModelChangeError(config, message) {
+  await postEvent(config, {
+    type: "external_conversation_item",
+    data: {
+      response_id: `pi-model-change-error-${Date.now()}`,
+      item_type: "error",
+      item_data: {
+        source: "execution",
+        code: "pi_model_change_failed",
+        message,
+      },
+    },
+  });
+}
+
+function modelReference(model) {
+  const modelId = model && typeof model.id === "string" ? model.id : "";
+  if (!modelId) return "";
+  const provider = model && typeof model.provider === "string" ? model.provider : "";
+  if (hasInferenceBinding() && inferenceProviderIds.has(provider)) return modelId;
+  return provider ? `${provider}/${modelId}` : modelId;
+}
+
+/**
+ * Publish Pi's scoped models plus the current model to the web picker.
+ * Without a scope, use authenticated models; older registries fall back to getAll.
+ * An empty or unavailable registry posts nothing.
+ */
+async function postModelOptions(config, ctx) {
+  let models = [];
+  const scoped = ctx && Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
+  for (const entry of scoped) {
+    if (entry && entry.model) models.push(entry.model);
+  }
+  if (models.length > 0) {
+    const current = ctx ? ctx.model : undefined;
+    const currentId = modelReference(current);
+    if (currentId && !models.some((model) => modelReference(model) === currentId)) {
+      models = [current, ...models];
+    }
+  } else {
+    const registry = ctx ? ctx.modelRegistry : undefined;
+    if (!registry) return;
+    try {
+      if (typeof registry.getAvailable === "function") {
+        models = registry.getAvailable();
+      } else if (typeof registry.getAll === "function") {
+        models = registry.getAll();
+      } else {
+        return;
+      }
+    } catch (_err) {
+      return;
+    }
+  }
+  if (!Array.isArray(models) || models.length === 0) return;
+  const options = [];
+  const seen = new Set();
+  for (const model of models) {
+    if (hasInferenceBinding() && (!model || !inferenceProviderIds.has(model.provider))) continue;
+    const modelId = model && typeof model.id === "string" ? model.id : "";
+    const id = modelReference(model);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name =
+      model && typeof model.name === "string" && model.name ? model.name : modelId;
+    options.push({ id, model: id, displayName: name });
+  }
+  if (options.length === 0) return;
+  await postEvent(config, {
+    type: "external_model_options",
+    data: { models: options },
+  });
+}
+
+/**
+ * Tell the runner's terminal watcher that Pi now accepts input: the inbox
+ * poller is armed, so queued web messages will be delivered. The runner
+ * clears the marker before each launch and logs ``native_input_ready`` when
+ * it appears. Best-effort — readiness logging must never break the session.
+ */
+function markInputReady(config) {
+  if (!config || !config.bridgeDir) return;
+  try {
+    fs.writeFileSync(path.join(config.bridgeDir, "input_ready"), "");
+  } catch (_err) {
+    // Diagnostics only.
+  }
+}
+
+function startInboxPoller(
+  pi,
+  config,
+  handleInterrupt,
+  handleCompact,
+  handleModelChange,
+  handleThinkingLevelChange,
+  isTurnActive,
+  isCompacting,
+) {
+  if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
+  // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
+  // long-lived TUI mustn't grow it unboundedly.
+  const seen = new Set();
+  const SEEN_CAP = 4096;
+  const rememberSeen = (id) => {
+    seen.add(id);
+    while (seen.size > SEEN_CAP) seen.delete(seen.values().next().value);
+  };
+  // Cap send attempts so a persistently-failing sendUserMessage can't
+  // re-read+re-throw the same file forever (the turn is already reported done).
+  const deliverAttempts = new Map();
+  const MAX_DELIVER_ATTEMPTS = 5;
+  pi.__omnigentInboxPoller = setInterval(() => {
+    let files = [];
+    try {
+      files = fs
+        .readdirSync(config.inboxDir)
+        .filter((name) => name.endsWith(".json"))
+        .sort();
+    } catch (_err) {
+      return;
+    }
+    for (const file of files) {
+      const fullPath = path.join(config.inboxDir, file);
+      let payload;
+      try {
+        payload = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+      } catch (_err) {
+        continue;
+      }
+      // Dedup only on a real string id; seen.has(undefined) would drop every
+      // later id-less payload.
+      const id = typeof payload?.id === "string" ? payload.id : null;
+      if (!payload || (id !== null && seen.has(id))) {
+        try {
+          fs.unlinkSync(fullPath);
+        } catch (_err) {}
+        continue;
+      }
+      // Pi's extension API cannot accept prompts during manual compaction.
+      // Leave them on disk, in order, until its completion callback fires.
+      if (
+        (payload.type === "user_message" || payload.type === "compact") &&
+        isCompacting()
+      ) {
+        continue;
+      }
+      if (
+        payload.type === "user_message" &&
+        typeof payload.content === "string"
+      ) {
+        // Mid-turn messages must STEER into the active turn: the Pi SDK
+        // holds deliverAs "followUp" until the whole agent loop finishes, so
+        // a web "Send now" delivered as a follow-up stays visibly queued in
+        // the Pi CLI even though the web UI already reported success. When
+        // the agent is idle, keep "followUp" — it starts the next turn
+        // immediately, preserving initiating-message behavior. A turn ending
+        // between this check and the send is benign: the message still
+        // reaches Pi's queue, and a throw leaves the file for the next tick,
+        // which recomputes the mode.
+        const deliverAs =
+          typeof isTurnActive === "function" && isTurnActive()
+            ? "steer"
+            : "followUp";
+        try {
+          pi.sendUserMessage(payload.content, { deliverAs });
+        } catch (_err) {
+          // Leave the file to retry next tick, capped by attempt count.
+          const key = id ?? fullPath;
+          const attempts = (deliverAttempts.get(key) ?? 0) + 1;
+          if (attempts < MAX_DELIVER_ATTEMPTS) {
+            deliverAttempts.set(key, attempts);
+            continue;
+          }
+          // Cap reached: surface the dropped follow-up without faking a turn
+          // failure. The runner treats external_session_status:failed as
+          // terminal for native sub-agents, so use a non-content conversation
+          // error item and consume the file to stop the spin. Include the
+          // message id and a short content preview so an operator can identify
+          // what was lost (data loss; the file is unlinked below).
+          deliverAttempts.delete(key);
+          const droppedId = id ?? "(no id)";
+          const preview =
+            typeof payload.content === "string"
+              ? payload.content.length > 80
+                ? `${payload.content.slice(0, 80)}…`
+                : payload.content
+              : "";
+          postEvent(config, {
+            type: "external_conversation_item",
+            data: {
+              response_id: `pi-deliver-dropped-${Date.now()}`,
+              item_type: "error",
+              item_data: {
+                source: "execution",
+                code: "pi_followup_delivery_dropped",
+                message:
+                  `Omnigent: a queued follow-up message (id ${droppedId}) could ` +
+                  `not be delivered to Pi after ${MAX_DELIVER_ATTEMPTS} attempts ` +
+                  `and was dropped. Content preview: ${JSON.stringify(preview)}`,
+              },
+            },
+          });
+          try {
+            fs.unlinkSync(fullPath);
+          } catch (_err) {}
+          continue;
+        }
+        deliverAttempts.delete(id ?? fullPath);
+      }
+      if (payload.type === "interrupt") {
+        // An interrupt is point-in-time: make one delivery attempt, then
+        // always consume the file (below). If there is no live turn to abort
+        // right now, the interrupt is simply dropped — leaving the file would
+        // re-read it every tick forever and, once a later turn creates an
+        // abortable context, abort that unrelated turn. requestInterrupt only
+        // arms the pendingInterrupt window when it catches a genuinely running
+        // turn (idle interrupts are dropped, not armed — see F18), so a turn
+        // already in flight still gets aborted via replay without poisoning the
+        // next freshly-started turn.
+        if (typeof handleInterrupt === "function") handleInterrupt();
+      }
+      if (payload.type === "compact") {
+        // Point-in-time like an interrupt: one delivery attempt against the
+        // resident context, then always consume the file (below) — leaving it
+        // would re-trigger compaction every tick. handleCompact owns every
+        // status edge and the unavailable-context error item, so its returned
+        // promise is intentionally discarded: there is nothing for the poller
+        // to retry or clean up.
+        if (typeof handleCompact === "function") {
+          handleCompact(
+            typeof payload.custom_instructions === "string"
+              ? payload.custom_instructions
+              : undefined,
+          );
+        }
+      }
+      if (payload.type === "model_change") {
+        // Point-in-time like compact/interrupt: one delivery attempt against
+        // the resident context, then always consume the file (below).
+        // handleModelChange owns its visible-error item and posts nothing on
+        // success — the paired model_select handler mirrors the applied model
+        // back — so the returned promise is intentionally discarded.
+        handleModelChange(
+          typeof payload.model === "string" ? payload.model : undefined,
+          payload.thinkingLevel,
+        );
+      }
+      if (payload.type === "thinking_level_change") {
+        // Point-in-time: one delivery attempt, then always consume the file.
+        // Pi's setThinkingLevel is async but fire-and-forget here — success is
+        // visible in Pi's TUI menu and the returned promise is discarded.
+        if (
+          typeof handleThinkingLevelChange === "function" &&
+          typeof payload.thinkingLevel === "string"
+        ) {
+          handleThinkingLevelChange(payload.thinkingLevel);
+        }
+      }
+      if (id !== null) rememberSeen(id);
+      try {
+        fs.unlinkSync(fullPath);
+      } catch (_err) {}
+    }
+  }, 250);
+}
+
+module.exports = function (pi) {
+  process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
+  const config = readConfig();
+  const history = createHistoryQueue(config);
+  pi.on("session_shutdown", () => history.close());
+  pi.on("session_compact", async (_event, ctx) => {
+    const manager = ctx?.sessionManager;
+    if (typeof manager?.buildSessionProjection !== "function") return;
+    const notifyFailure = () =>
+      ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
+    let checkpoint;
+    let compactedMessages;
+    let sourceId;
+    try {
+      const projection = manager.buildSessionProjection();
+      // Pi 1.3's event can name an older entry when summaries repeat.
+      checkpoint = projection?.entries?.[0]?.sourceEntry;
+      if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") {
+        throw new Error("Pi's projection does not start with a compaction checkpoint");
+      }
+      sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
+      compactedMessages = compactionSnapshotItems(projection.messages ?? []);
+    } catch (error) {
+      console.error("[pi-native] Compaction snapshot failed:", error);
+      notifyFailure();
+      return;
+    }
+    const item = history.enqueue(
+      {
+        item_type: "compaction",
+        item_data: {
+          summary: checkpoint.summary,
+          last_item_id: "",
+          model: ctx.model?.id || null,
+          token_count: Math.ceil(checkpoint.summary.length / 4),
+          window_id: checkpoint.id,
+          compacted_messages: compactedMessages,
+        },
+      },
+      sourceId,
+      { onFailure: notifyFailure },
+    );
+    // Pi awaits this handler before finishing compaction.
+    if (item) await settledWithinBudget(item.settled);
+  });
+  let sequence = 0;
+  let turnOrdinal = 0;
+  let activeResponseId = null;
+  // Response id shared across a turn's ``running`` → ``idle`` status pair.
+  // Kept separate from activeResponseId, which turn_start overwrites.
+  let turnStatusResponseId = null;
+  let turnResult = null;
+  let turnOutcomeController = new AbortController();
+  // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
+  // as the no-isIdle() fallback for requestInterrupt instead of
+  // !activeResponseId: agent_start resets activeResponseId to null and only
+  // turn_start assigns it, so an interrupt landing in that gap (after
+  // agent_start, before turn_start) would look idle by activeResponseId yet the
+  // loop is genuinely running — agentRunning arms it correctly. See F18.
+  let agentRunning = false;
+  let compacting = false;
+  let latestContext = null;
+  // Input waits for ordered model/effort changes, including Pi's async auth check.
+  let pendingSettingsChange = Promise.resolve();
+  function queueSettingsChange(change) {
+    pendingSettingsChange = pendingSettingsChange.then(change).catch(async () => {
+      await postModelChangeError(config, "Omnigent: updating Pi settings failed.");
+    });
+    return pendingSettingsChange;
+  }
+  // Set once route-turn gives a final answer for this session (see ``input``).
+  let turnRoutingDone = false;
+  let pendingInterruptUntil = 0;
+  const postedToolCalls = new Set();
+  const postedToolResults = new Set();
+  const postedReasoning = new Set();
+  const postedAssistantMessages = new Set();
+  const streamedReasoningBlocks = new Set();
+  const toolCallsById = new Map();
+  let toolCallBytes = 0;
+  const pendingInterruptMs = 30_000;
+  // Live streaming state for assistant text deltas. Pi emits
+  // message_update events carrying an assistantMessageEvent of type
+  // "text_delta" (token chunk) / "text_end" (block complete) during a
+  // turn — see @earendil-works/pi-ai AssistantMessageEvent. We forward
+  // each token as a transient external_output_text_delta so the web UI
+  // paints a live preview before the final message lands.
+  //
+  // The preview is keyed by ASSISTANT MESSAGE, not per text block: the
+  // web UI (chatStore.pumpStreamEvents) finalizes the OLDEST in-flight
+  // "live:<message_id>" preview when the authoritative text_done arrives,
+  // FIFO, and message_end posts ONE combined external_conversation_item
+  // per assistant message (textFromMessage joins all text blocks). So a
+  // 1:1 message-scoped id keeps exactly one preview per item; a per-block
+  // id would orphan extra previews when a message has multiple text
+  // blocks (e.g. text → tool call → more text). All text blocks of a
+  // message share its id with a single monotonic chunk index, so the
+  // preview reads as one growing message — matching claude-native.
+  //
+  // Deltas are best-effort live preview: postEvent fails open, and the
+  // authoritative text still arrives via message_end regardless.
+  //
+  // streamingMessageOrdinal: bumped at each assistant message_end so the
+  // NEXT message of the turn gets a fresh, stable id distinct from earlier
+  // ones — see the message_end handler for why it advances there (not on
+  // message_start) so deltas and the finalize agree on the id.
+  let streamingMessageOrdinal = 0;
+  // streamedTextIndex: message_id -> next 0-based chunk index.
+  const streamedTextIndex = new Map();
+  // finalizedTextBlocks: message_ids whose final delta was already posted,
+  // so a duplicate text_end (or a stray text_delta after end) can't reopen
+  // or double-finalize the preview.
+  const finalizedTextBlocks = new Set();
+
+  // Names of the Omnigent tools registered via pi.registerTool below. Bridged
+  // tools are policy-evaluated server-side inside the /mcp proxy (TOOL_CALL +
+  // TOOL_RESULT), so the tool_call hook must NOT also call
+  // evalNativePolicyHttp for them — that would double-evaluate and, for ASK
+  // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
+  // in this set and stay gated by the hook below.
+  const bridgedTools = new Set();
+  if (config && Array.isArray(config.tools)) {
+    for (const tool of config.tools) {
+      if (!tool || typeof tool !== "object") continue;
+      const name = typeof tool.name === "string" ? tool.name : "";
+      if (!name) continue;
+      bridgedTools.add(name);
+      const description =
+        typeof tool.description === "string" ? tool.description : "";
+      const parameters =
+        tool.parameters && typeof tool.parameters === "object"
+          ? tool.parameters
+          : { type: "object", properties: {} };
+      // Pi passes tool.parameters straight to the LLM as JSON Schema, so the
+      // Omnigent schema is usable as-is. execute() round-trips the call to the
+      // Omnigent server's MCP proxy and returns the result to Pi.
+      if (typeof pi.registerTool === "function") {
+        pi.registerTool({
+          name,
+          label: name,
+          description,
+          promptSnippet: description ? description.slice(0, 120) : name,
+          parameters,
+          async execute(_toolCallId, params) {
+            return callOmnigentTool(config, name, params || {});
+          },
+        });
+      }
+    }
+  }
+
+  let taskList = [];
+
+  function normalizeTaskList(value) {
+    if (!Array.isArray(value)) return null;
+    const statuses = new Set(["not-started", "in-progress", "completed"]);
+    const normalized = [];
+    for (const task of value) {
+      if (
+        !task ||
+        typeof task !== "object" ||
+        !Number.isInteger(task.id) ||
+        typeof task.title !== "string" ||
+        typeof task.description !== "string" ||
+        !statuses.has(task.status)
+      ) {
+        return null;
+      }
+      normalized.push({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+      });
+    }
+    return normalized;
+  }
+
+  async function publishTaskList() {
+    const status = {
+      "not-started": "pending",
+      "in-progress": "in_progress",
+      completed: "completed",
+    };
+    await postEvent(config, {
+      type: "external_session_todos",
+      data: {
+        todos: taskList.map((task) => ({
+          content: task.title,
+          status: status[task.status],
+          activeForm: task.description || task.title,
+        })),
+      },
+    });
+  }
+
+  function restoreTaskList(ctx) {
+    taskList = [];
+    const entries =
+      ctx &&
+      ctx.sessionManager &&
+      typeof ctx.sessionManager.getBranch === "function"
+        ? ctx.sessionManager.getBranch()
+        : [];
+    for (const entry of entries) {
+      const message = entry && entry.type === "message" ? entry.message : null;
+      if (
+        !message ||
+        message.role !== "toolResult" ||
+        message.toolName !== "manage_todo_list"
+      ) {
+        continue;
+      }
+      const restored = normalizeTaskList(
+        message.details && message.details.todos,
+      );
+      if (restored) taskList = restored;
+    }
+  }
+
+  function registerTaskToolIfMissing() {
+    if (typeof pi.registerTool !== "function") return;
+    const existing =
+      typeof pi.getAllTools === "function"
+        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
+        : false;
+    if (existing) return;
+    pi.registerTool({
+      name: "manage_todo_list",
+      label: "Task Plan",
+      description:
+        "Read or replace the task plan shown in the Omnigent Tasks panel.",
+      promptSnippet: "Read or replace the current task plan",
+      promptGuidelines: [
+        "For every multi-step task, you must call manage_todo_list before using other tools to create a plan, then update it after each step until all tasks are completed.",
+      ],
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["read", "write"] },
+          todoList: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "integer" },
+                title: { type: "string" },
+                description: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["not-started", "in-progress", "completed"],
+                },
+              },
+              required: ["id", "title", "description", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        if (params && params.operation === "read") {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(taskList, null, 2) },
+            ],
+            details: { operation: "read", todos: taskList },
+          };
+        }
+        if (!params || params.operation !== "write") {
+          throw new Error("operation must be read or write");
+        }
+        const next = normalizeTaskList(params.todoList);
+        if (!next) throw new Error("todoList must contain valid task items");
+        taskList = next;
+        await publishTaskList();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task plan updated (${taskList.length} task${taskList.length === 1 ? "" : "s"}).`,
+            },
+          ],
+          details: { operation: "write", todos: taskList },
+        };
+      },
+    });
+  }
+
+  async function syncTaskListFromResult(event) {
+    if (!event || event.toolName !== "manage_todo_list" || event.isError)
+      return;
+    const result =
+      event.result && typeof event.result === "object" ? event.result : event;
+    const next = normalizeTaskList(result.details && result.details.todos);
+    if (!next) return;
+    const changed = JSON.stringify(next) !== JSON.stringify(taskList);
+    taskList = next;
+    if (changed) await publishTaskList();
+  }
+
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
+  const countedUsageMessages = new Set();
+  let cumulativeInputTokens = 0;
+  let cumulativeOutputTokens = 0;
+  let cumulativeCacheReadTokens = 0;
+  let cumulativeCostUsd = 0;
+  let completeCost = true;
+  let usageModel = null;
+  let lastPostedUsageKey = "";
+
+  // Build a stable fingerprint for one assistant message so the same message
+  // arriving on multiple lifecycle events is only counted once. Pi's
+  // ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
+  // but DOES carry an optional provider ``responseId`` and a required numeric
+  // ``timestamp`` — both stable across the same message's re-emission on
+  // ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
+  // fields (plus a forward-compat ``id``) over the usage-count fingerprint:
+  // hashing counts alone collides two DISTINCT LLM calls that happen to report
+  // identical token counts (e.g. two identical short acks under prompt
+  // caching), which would silently drop the second call's tokens (undercount).
+  // The usage-count fingerprint stays only as a last resort for a message that
+  // carries no identity field at all.
+  function usageMessageKey(message, usage) {
+    if (message && typeof message === "object") {
+      if (typeof message.id === "string" && message.id)
+        return `id:${message.id}`;
+      if (typeof message.responseId === "string" && message.responseId)
+        return `rid:${message.responseId}`;
+      if (typeof message.timestamp === "number")
+        return `ts:${message.timestamp}`;
+    }
+    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+  }
+
+  // Fold one assistant message's usage into the cumulative session totals,
+  // deduped by fingerprint. Returns true when it counted (totals advanced).
+  function accumulateUsage(message) {
+    const usage = extractPiUsage(message);
+    if (!usage) return false;
+    const key = usageMessageKey(message, usage);
+    if (countedUsageMessages.has(key)) return false;
+    countedUsageMessages.add(key);
+    // The server's ``cumulative_input_tokens`` is INCLUSIVE of cache reads (it
+    // splits the cache portion back out and prices it at the cache-read rate),
+    // so add cacheRead into the input total. ``cacheWrite`` (cache creation)
+    // has no dedicated cumulative field on the server, so fold it into the
+    // input total too — it is then priced at the input rate rather than the
+    // ~1.25x cache-write rate, a small, documented approximation that never
+    // drops the tokens.
+    cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
+    cumulativeOutputTokens += usage.output;
+    cumulativeCacheReadTokens += usage.cacheRead;
+    if (usage.cost === null) completeCost = false;
+    else cumulativeCostUsd += usage.cost;
+    if (usage.model) usageModel = usage.model;
+    return true;
+  }
+
+  function usagePostKey() {
+    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
+  }
+
+  // Persist before reporting; unchanged totals need no additional POST.
+  async function postSessionUsage() {
+    if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
+    const postKey = usagePostKey();
+    if (postKey === lastPostedUsageKey) return;
+    lastPostedUsageKey = postKey;
+    // Persist the running total before the POST so a relaunch restores it even
+    // when the flush fails and the server never records this report.
+    persistCumulativeUsage();
+    const data = {
+      cost_complete: completeCost,
+      cumulative_input_tokens: cumulativeInputTokens,
+      cumulative_output_tokens: cumulativeOutputTokens,
+      cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+    };
+    if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
+    if (usageModel) data.model = usageModel;
+    await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  // Restore cumulative totals before recording new usage after a relaunch.
+  function usageStatePath() {
+    if (!config || !config.bridgeDir) return null;
+    return path.join(config.bridgeDir, "cumulative_usage.json");
+  }
+
+  function persistCumulativeUsage() {
+    const statePath = usageStatePath();
+    if (!statePath) return;
+    // Per-pid temp name: an exiting Pi process and its relaunched successor
+    // can flush concurrently, and a shared temp path could persist a torn file.
+    const tmp = `${statePath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          cumulative_input_tokens: cumulativeInputTokens,
+          cumulative_output_tokens: cumulativeOutputTokens,
+          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          cost_complete: completeCost,
+          ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
+          model: usageModel,
+        }),
+      );
+      fs.renameSync(tmp, statePath);
+    } catch (_err) {
+      // Remove temporary state after a failed best-effort checkpoint.
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_cleanupErr) {}
+    }
+  }
+
+  function raiseUsageTotals(saved) {
+    if (!saved || typeof saved !== "object") return;
+    const input = toInt(saved.cumulative_input_tokens);
+    const output = toInt(saved.cumulative_output_tokens);
+    const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    const cost = validCost(saved.cumulative_cost_usd);
+    const coversCurrent = input >= cumulativeInputTokens && output >= cumulativeOutputTokens;
+    if (coversCurrent && (input || output)) {
+      completeCost = cost !== null && saved.cost_complete !== false;
+    } else if (input > cumulativeInputTokens || output > cumulativeOutputTokens) {
+      completeCost = false;
+    }
+    if (completeCost && cost !== null) cumulativeCostUsd = Math.max(cumulativeCostUsd, cost);
+    // Only raise the counters; a stale file must never pull a live total down.
+    if (input > cumulativeInputTokens) cumulativeInputTokens = input;
+    if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
+    if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
+    if (!usageModel && typeof saved.model === "string" && saved.model)
+      usageModel = saved.model;
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens) &&
+      (!completeCost || cumulativeCostUsd === (validCost(baseline.cumulative_cost_usd) ?? 0))
+    ) {
+      lastPostedUsageKey = usagePostKey();
+    }
+  }
+
+  function rememberContext(ctx) {
+    if (ctx) latestContext = ctx;
+  }
+
+  function newResponseId(prefix) {
+    return `pi-${prefix}-${Date.now()}-${++sequence}`;
+  }
+
+  function currentResponseId() {
+    if (!activeResponseId) activeResponseId = newResponseId("turn");
+    return activeResponseId;
+  }
+
+  function hasPendingInterrupt() {
+    if (!pendingInterruptUntil) return false;
+    if (Date.now() > pendingInterruptUntil) {
+      pendingInterruptUntil = 0;
+      return false;
+    }
+    return true;
+  }
+
+  function safeIsIdle(ctx) {
+    // Returns true/false from the SDK's isIdle(), or null when the signal is
+    // unavailable (older SDK) or throws, so the caller can fall back.
+    // Deliberately returns null (not true) on throw so callers fall back to loop
+    // state (!agentRunning) rather than blindly treating the agent as idle.
+    if (!ctx || typeof ctx.isIdle !== "function") return null;
+    try {
+      return ctx.isIdle();
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function requestInterrupt(ctx) {
+    // ctx.abort() is a silent no-op when the Pi agent is idle (it does NOT
+    // throw), so an interrupt that arrives with no live turn must NOT arm the
+    // replay window — otherwise the 30s window poisons the next legitimately
+    // started turn (F18). Only arm when a turn is genuinely in-flight: prefer
+    // the SDK's isIdle(), and fall back to the agent loop state on SDK versions
+    // that don't expose it.
+    const idle = safeIsIdle(ctx);
+    const turnIsIdle = idle === null ? !agentRunning : idle;
+    if (turnIsIdle) return false;
+    const accepted = interruptActiveContext(ctx);
+    if (!accepted) return false;
+    pendingInterruptUntil = Date.now() + pendingInterruptMs;
+    return true;
+  }
+
+  function replayPendingInterrupt(ctx) {
+    if (!hasPendingInterrupt()) return false;
+    interruptActiveContext(ctx);
+    return true;
+  }
+
+  function clearPendingInterrupt() {
+    pendingInterruptUntil = 0;
+  }
+
+  async function postToolCall(toolCall, responseId) {
+    if (!toolCall || typeof toolCall !== "object") return;
+    const callId = String(toolCall.id || toolCall.toolCallId || "");
+    const name = String(toolCall.name || toolCall.toolName || "");
+    if (!callId || !name) return;
+    const key = `${responseId}:${callId}`;
+    if (postedToolCalls.has(key)) return;
+    const known = toolCallsById.get(callId);
+    const item = history.enqueue(
+      {
+        response_id: responseId,
+        item_type: "function_call",
+        item_data: {
+          agent: "Pi",
+          name,
+          arguments: safeJsonStringify(
+            toolCall.arguments ?? toolCall.input ?? {},
+          ),
+          call_id: callId,
+        },
+      },
+      `pi:tool-call:${key}`,
+      {
+        onAccepted: () => postedToolCalls.add(key),
+        previous: known?.key === key ? known.item : undefined,
+      },
+    );
+    toolCallBytes -= toolCallsById.get(callId)?.item?.bytes || 0;
+    toolCallsById.delete(callId);
+    toolCallsById.set(callId, { key, responseId, name, item });
+    toolCallBytes += item?.bytes || 0;
+    while (
+      toolCallsById.size > _HISTORY_QUEUE_MAX_ITEMS || toolCallBytes > _HISTORY_QUEUE_MAX_BYTES
+    ) {
+      const oldest = toolCallsById.keys().next().value;
+      toolCallBytes -= toolCallsById.get(oldest)?.item?.bytes || 0;
+      toolCallsById.delete(oldest);
+    }
+  }
+
+  async function postToolResult(event, responseId) {
+    if (!event || typeof event !== "object") return;
+    const callId = String(event.toolCallId || event.id || "");
+    if (!callId) return;
+    const known = toolCallsById.get(callId);
+    const key = known && known.key ? known.key : `${responseId}:${callId}`;
+    if (postedToolResults.has(key)) return;
+    const dependency = known?.item ||
+      (postedToolCalls.has(key) ? { accepted: true, bytes: 0 } : null);
+    if (!dependency) {
+      console.error(`[pi-native] Withholding result without a queued call: ${callId}`);
+      return;
+    }
+    history.enqueue(
+      {
+        response_id: known && known.responseId ? known.responseId : responseId,
+        item_type: "function_call_output",
+        item_data: {
+          call_id: callId,
+          output: textFromToolResult(event),
+        },
+      },
+      `pi:tool-result:${key}`,
+      { onAccepted: () => postedToolResults.add(key), dependency },
+    );
+  }
+
+  async function postCompletedReasoning(text, responseId, keyHint, streamed) {
+    if (typeof text !== "string" || !text.trim()) return;
+    const textKey = `${responseId}:text:${fingerprint(text)}`;
+    const key = `${responseId}:${keyHint || fingerprint(text)}`;
+    if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
+    if (!streamed && !postedReasoning.has(`delta:${textKey}`)) {
+      postedReasoning.add(`delta:${textKey}`);
+      await postEvent(config, {
+        type: "external_output_reasoning_delta",
+        data: { delta: text, started: true },
+      });
+    }
+    history.enqueue(
+      {
+        response_id: responseId,
+        item_type: "reasoning",
+        item_data: {
+          agent: "Pi",
+          summary: [],
+          content: [{ type: "reasoning_text", text }],
+        },
+      },
+      `pi:reasoning:${textKey}`,
+      { onAccepted: () => {
+        postedReasoning.add(key);
+        postedReasoning.add(textKey);
+      } },
+    );
+  }
+
+  function reasoningBlockKey(responseId, contentIndex) {
+    return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
+  }
+
+  async function postReasoningDelta(update, responseId) {
+    if (typeof update.delta !== "string" || !update.delta) return;
+    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+    const started = !streamedReasoningBlocks.has(blockKey);
+    streamedReasoningBlocks.add(blockKey);
+    await postEvent(config, {
+      type: "external_output_reasoning_delta",
+      data: { delta: update.delta, started },
+    });
+  }
+
+  function streamingMessageId(responseId) {
+    // Stable per-assistant-message id across all of the message's text
+    // chunks. The web UI keys an in-flight "live:<message_id>" preview off
+    // this, appends each chunk in `index` order, and reconciles it against
+    // the authoritative assistant item by FIFO retirement. responseId
+    // scopes it to this turn and the ordinal distinguishes successive
+    // assistant messages within the turn, so a finalized message's id is
+    // never reused by a later one.
+    return `${responseId}:msg:${streamingMessageOrdinal}`;
+  }
+
+  async function postOutputTextDelta(messageId, delta, options) {
+    // Transient assistant-text chunk for live preview (Responses-style
+    // response.output_text.delta on the wire). Not persisted; the
+    // authoritative final text arrives separately via
+    // external_conversation_item. A blank, non-final delta carries no
+    // signal — skip it so an empty token can't churn the UI buffer.
+    const final = !!(options && options.final);
+    if (typeof delta !== "string") return;
+    if (!delta && !final) return;
+    const index = streamedTextIndex.get(messageId) || 0;
+    streamedTextIndex.set(messageId, index + 1);
+    await postEvent(config, {
+      type: "external_output_text_delta",
+      data: {
+        delta,
+        message_id: messageId,
+        index,
+        final,
+      },
+    });
+  }
+
+  async function postTextDelta(update, responseId) {
+    // assistantMessageEvent of type "text_delta": one streamed token of
+    // the current assistant message. All text blocks of the message share
+    // its id, so the preview reads as one growing message.
+    if (!update || typeof update.delta !== "string" || !update.delta) return;
+    const messageId = streamingMessageId(responseId);
+    if (finalizedTextBlocks.has(messageId)) return;
+    await postOutputTextDelta(messageId, update.delta);
+  }
+
+  async function finalizeStreamingMessage(responseId) {
+    // Emit a final-marker delta so the web UI knows no further chunks will
+    // arrive for this message_id and can stop the live buffer. The marker
+    // carries no new text (the running preview already holds the full
+    // message); message_end posts the authoritative item that replaces the
+    // preview in place. Only finalize a message we actually streamed (a
+    // message with no text_delta has no live preview to close).
+    const messageId = streamingMessageId(responseId);
+    if (finalizedTextBlocks.has(messageId)) return;
+    if (!streamedTextIndex.has(messageId)) return;
+    finalizedTextBlocks.add(messageId);
+    await postOutputTextDelta(messageId, "", { final: true });
+  }
+
+  async function mirrorAssistantMessage(message, responseId) {
+    const blocks = contentBlocks(message);
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index];
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "toolCall") await postToolCall(block, responseId);
+      if (block.type === "thinking") {
+        const text = typeof block.thinking === "string" ? block.thinking : "";
+        const key = block.thinkingSignature || `${turnOrdinal}:${index}`;
+        const blockKey = reasoningBlockKey(responseId, index);
+        await postCompletedReasoning(
+          text,
+          responseId,
+          key,
+          streamedReasoningBlocks.has(blockKey),
+        );
+      }
+    }
+  }
+
+  pi.registerCommand("omnigent", {
+    description: "Show the Omnigent conversation URL",
+    async handler(_args, ctx) {
+      setOmnigentStatus(config, ctx, "linked");
+      if (ctx && ctx.ui && config && config.conversationUrl) {
+        ctx.ui.notify(`Omnigent: ${config.conversationUrl}`, "info");
+      }
+    },
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    rememberContext(ctx);
+    restoreCumulativeUsage();
+    wrapExtensionUi(ctx, config);
+    registerTaskToolIfMissing();
+    restoreTaskList(ctx);
+    if (taskList.length) await publishTaskList();
+    setOmnigentStatus(config, ctx, "linked");
+    startInboxPoller(
+      pi,
+      config,
+      () => requestInterrupt(latestContext),
+      async (customInstructions) => {
+        const responseId = turnStatusResponseId ?? newResponseId("compact");
+        compacting = true;
+        try {
+          await postEvent(config, {
+            type: "external_session_status",
+            data: { status: "running", response_id: responseId },
+          });
+          await triggerCompaction(config, latestContext, customInstructions);
+        } finally {
+          if (!agentRunning) {
+            await postEvent(config, {
+              type: "external_session_status",
+              data: { status: "idle", turn_completed: false, response_id: responseId },
+            });
+          }
+          compacting = false;
+        }
+      },
+      (model, thinkingLevel) =>
+        queueSettingsChange(() =>
+          applyModelChange(pi, config, latestContext, model, thinkingLevel),
+        ),
+      (level) => queueSettingsChange(() => pi.setThinkingLevel(level)),
+      () => {
+        // Prefer the SDK's live idle signal; fall back to the agent loop
+        // state on SDK versions that don't expose isIdle() (same fallback
+        // as requestInterrupt).
+        const idle = safeIsIdle(latestContext);
+        return idle === null ? agentRunning : !idle;
+      },
+      () => compacting,
+    );
+    markInputReady(config);
+    const nativeSessionId =
+      ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
+        ? ctx.sessionManager.getSessionId()
+        : undefined;
+    await patchExternalSessionId(config, nativeSessionId);
+    // Publish Pi's live model catalog so the Web UI picker populates from what
+    // Pi actually loaded, independent of how it authenticated.
+    await postModelOptions(config, ctx);
+    // Report the model Pi launched with so the composer pill and the picker's
+    // active row reflect the current model from the start. Without this, a
+    // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
+    // shows no active model until the user switches. Mirrors the
+    // ``model_select`` handler, but for the startup value ``ctx.model``.
+    const startupModel = modelReference(ctx ? ctx.model : undefined);
+    if (startupModel) {
+      await postEvent(config, {
+        type: "external_model_change",
+        data: { model: startupModel },
+      });
+    }
+    // Publish readiness before usage so a hung POST cannot delay input handling.
+    await postSessionUsage();
+    // Readiness is not turn completion: a queued prompt may already be running.
+    // Only agent_end publishes idle so startup cannot complete a child task.
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreTaskList(ctx);
+    await publishTaskList();
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    rememberContext(ctx);
+    // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
+    // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
+    // ``restore`` — that is Pi re-applying the session's saved model at
+    // startup, not a user switch, and posting it could clobber a pending
+    // web-side override. The server dedups against ``model_override``, so a
+    // web-initiated switch (which already persisted the value before queuing
+    // the inbox ``model_change``) round-trips here as a no-op.
+    const source =
+      event && typeof event.source === "string" ? event.source : "";
+    if (source === "restore") return;
+    const model = event && event.model ? event.model : undefined;
+    const selectedModel = modelReference(model);
+    if (!selectedModel) return;
+    await postEvent(config, {
+      type: "external_model_change",
+      data: { model: selectedModel },
+    });
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    rememberContext(ctx);
+    // A brand-new agent loop must never inherit a replay window armed before it
+    // began (e.g. a spuriously-armed window from an interrupt that landed while
+    // idle). A legitimate interrupt that arrives after this point belongs to
+    // this loop and can still arm/replay; agent_end clears once the loop
+    // completes. See F18.
+    clearPendingInterrupt();
+    turnOutcomeController.abort();
+    turnOutcomeController = new AbortController();
+    agentRunning = true;
+    turnResult = null;
+    setOmnigentStatus(config, ctx, "running");
+    activeResponseId = null;
+    turnOrdinal = 0;
+    postedToolCalls.clear();
+    postedToolResults.clear();
+    postedReasoning.clear();
+    postedAssistantMessages.clear();
+    streamedReasoningBlocks.clear();
+    toolCallsById.clear();
+    toolCallBytes = 0;
+    streamedTextIndex.clear();
+    finalizedTextBlocks.clear();
+    streamingMessageOrdinal = 0;
+    // Pin the status response_id for this agent loop through agent_end.
+    turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
+    await postEvent(config, {
+      type: "external_session_status",
+      data: {
+        status: "running",
+        response_id: turnStatusResponseId,
+      },
+    });
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    rememberContext(ctx);
+    const cancelled = ctx?.signal?.aborted || hasPendingInterrupt();
+    const outcomeSignal = turnOutcomeController.signal;
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const result = turnResult;
+    const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
+    clearPendingInterrupt();
+    agentRunning = false;
+    setOmnigentStatus(config, ctx, "idle");
+    activeResponseId = null;
+    // Last-chance usage capture from the agent loop's final message set, in
+    // case neither ``message_end`` nor ``turn_end`` carried usage for some
+    // call. ``event.messages`` may hold the whole conversation; the
+    // fingerprint dedup means re-scanning already-counted messages is a no-op,
+    // so a plain forward-scan is safe (no overcount).
+    const messages =
+      event && Array.isArray(event.messages) ? event.messages : [];
+    let changed = false;
+    for (const message of messages) {
+      if (accumulateUsage(message)) changed = true;
+    }
+    if (changed) await postSessionUsage();
+    if (outcomeSignal.aborted) return;
+    // Reuse the agent_start response_id so the web client matches the idle
+    // edge and clears the "streaming" status, unblocking queued follow-ups.
+    turnStatusResponseId = null;
+    // Compaction interrupts a loop without completing its delegated task.
+    if (compacting) return;
+    const outcome = cancelled ? "cancelled" : result?.outcome ?? "failed";
+    // Readiness is not a completed result. Older servers may ignore this observation.
+    await postEvent(config, {
+      type: "subagent.status",
+      data: { idle: true, response_id: endResponseId },
+    }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
+    const drained = await drainedHistory;
+    if (outcomeSignal.aborted) return;
+    // Pi continues queued steering after agent_end; the parent's dispatch is still active.
+    if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
+    const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
+    const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
+    const output = deliveryFailed
+      ? "Omnigent could not save the Pi turn output; see host logs."
+      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
+    try {
+      await postEventWithRetry(config, {
+        type: "external_session_status",
+        data: {
+          status, response_id: endResponseId,
+          turn_completed: !deliveryFailed && outcome === "completed",
+          turn_outcome: deliveryFailed ? "failed" : outcome,
+          output,
+          ...(status === "failed" ? { failure_detail: output } : {}),
+        },
+      }, outcomeSignal);
+    } catch (error) {
+      if (outcomeSignal.aborted) return;
+      console.error("[pi-native] Failed to deliver turn outcome:", error);
+      ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
+    }
+  });
+
+  pi.on("turn_start", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    const index =
+      event && typeof event.turnIndex === "number"
+        ? event.turnIndex
+        : turnOrdinal + 1;
+    turnOrdinal = index;
+    activeResponseId = newResponseId(`turn-${turnOrdinal}`);
+  });
+
+  pi.on("message_update", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    const responseId = currentResponseId();
+    const update = event ? event.assistantMessageEvent : undefined;
+    if (!update || typeof update !== "object") return;
+    if (update.type === "text_delta") {
+      await postTextDelta(update, responseId);
+      return;
+    }
+    if (update.type === "thinking_delta") {
+      await postReasoningDelta(update, responseId);
+      return;
+    }
+    if (update.type === "toolcall_end") {
+      await postToolCall(update.toolCall, responseId);
+      return;
+    }
+    if (update.type === "thinking_end") {
+      const key = `${turnOrdinal}:${update.contentIndex}`;
+      const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+      await postCompletedReasoning(
+        update.content,
+        responseId,
+        key,
+        streamedReasoningBlocks.has(blockKey),
+      );
+    }
+  });
+
+  pi.on("tool_execution_start", async (_event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    rememberContext(ctx);
+    const blocked = replayPendingInterrupt(ctx);
+    const responseId = currentResponseId();
+    await postToolCall(
+      {
+        id: event && event.toolCallId,
+        name: event && event.toolName,
+        arguments: event && event.input,
+      },
+      responseId,
+    );
+    if (blocked) {
+      return { block: true, reason: "Interrupted by user" };
+    }
+    // Bridged Omnigent tools (registered via pi.registerTool above) are
+    // policy-evaluated server-side inside the /mcp proxy when execute() runs,
+    // so skip the hook-level eval for them to avoid double-evaluation and, for
+    // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
+    // are NOT bridged and stay gated here.
+    if (bridgedTools.has((event && event.toolName) || "")) {
+      return;
+    }
+    // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
+    // endpoint. This works even after the harness turn has completed (which
+    // happens immediately for pi-native — just enqueue + TurnComplete), so
+    // the verdict is always evaluated against live session policies regardless
+    // of whether an Omnigent turn is currently in flight.
+    const verdict = await evalNativePolicyHttp(
+      config,
+      (event && event.toolName) || "",
+      (event && event.input) || {},
+    );
+    if (verdict && verdict.block) {
+      return {
+        block: true,
+        reason: verdict.reason || "blocked by Omnigent policy",
+      };
+    }
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    await syncTaskListFromResult(event);
+    await postToolResult(event, currentResponseId());
+  });
+
+  pi.on("tool_execution_end", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    await postToolResult(event, currentResponseId());
+  });
+
+  pi.on("input", async (event, ctx) => {
+    rememberContext(ctx);
+    setOmnigentStatus(config, ctx, "running");
+    const text = event && typeof event.text === "string" ? event.text : "";
+    if (!text) return;
+    await pendingSettingsChange;
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
+    const responseId = newResponseId("user");
+    history.enqueue(
+      {
+        response_id: responseId,
+        item_type: "message",
+        item_data: {
+          role: "user",
+          content: [{ type: "input_text", text }],
+        },
+      },
+      `pi:user:${responseId}`,
+    );
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    setOmnigentStatus(config, ctx, undefined);
+    let message = event ? event.message : undefined;
+    const role = messageRole(message);
+    if (role !== "assistant") return;
+    const authFailure = nativeAuthFailure(message, ctx);
+    if (authFailure) {
+      message = { ...message, errorMessage: authFailure.message };
+      if (ctx && ctx.ui && ctx.ui.notify)
+        ctx.ui.notify(authFailure.message, "error");
+    }
+    const responseId = currentResponseId();
+    // Close the live preview for this message (no-op if nothing streamed),
+    // then bump the ordinal so the NEXT assistant message of this turn
+    // streams under a fresh, distinct id and never reuses this one's. The
+    // ordinal advances here (not on message_start) so the deltas just
+    // posted and this finalize agree on the id regardless of whether Pi
+    // fires message_start.
+    await finalizeStreamingMessage(responseId);
+    await mirrorAssistantMessage(message, responseId);
+    streamingMessageOrdinal += 1;
+    // ``message_end`` is the primary usage-capture site (one completed
+    // assistant message per LLM call); fold its token counts into the
+    // cumulative session totals and flush to the server for pricing.
+    if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string"
+        ? message.stopReason
+        : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string"
+        ? message.errorMessage
+        : "";
+    if (stopReason === "error" && errorMessage) {
+      const item = history.enqueue(
+        {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: authFailure ? authFailure.code : "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+        assistantMessageSourceId(message, responseId, errorMessage),
+      );
+      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
+      return;
+    }
+    const text = textFromMessage(message);
+    const outcome = stopReason === "aborted" ? "cancelled"
+      : stopReason === "toolUse" || stopReason === "error" ? "failed" : "completed";
+    if (!text) {
+      turnResult = { outcome, output: "", item: null };
+      return;
+    }
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
+    // The authoritative assistant item. The web UI retires + replaces the
+    // oldest in-flight live preview in place with this (FIFO; one preview
+    // per message), so the streamed partials never duplicate the final.
+    const item = history.enqueue(
+      {
+        response_id: responseId,
+        item_type: "message",
+        item_data: {
+          role: "assistant",
+          agent: "Pi",
+          content: [{ type: "output_text", text }],
+        },
+      },
+      sourceId,
+      {
+        onAccepted: () => postedAssistantMessages.add(sourceId),
+        onFailure: () => ctx?.ui?.notify?.(
+          "Omnigent could not save the assistant response; see host logs.", "error",
+        ),
+      },
+    );
+    turnResult = { item, outcome, output: item ? text : "History delivery rejected" };
+  });
+
+  pi.on("turn_end", async (event, ctx) => {
+    rememberContext(ctx);
+    replayPendingInterrupt(ctx);
+    const responseId = currentResponseId();
+    await mirrorAssistantMessage(event && event.message, responseId);
+    // Fallback usage capture: if Pi attached usage to the turn's final
+    // assistant message but no ``message_end`` carried it, fold it in here.
+    // Deduped by fingerprint, so a message already counted on ``message_end``
+    // is a no-op.
+    if (accumulateUsage(event && event.message)) await postSessionUsage();
+    const results =
+      event && Array.isArray(event.toolResults) ? event.toolResults : [];
+    for (const result of results) {
+      await postToolResult(result, responseId);
+    }
+  });
+};

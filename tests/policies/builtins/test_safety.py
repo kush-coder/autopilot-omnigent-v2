@@ -1,0 +1,1081 @@
+"""
+Tests for the built-in safety policies
+(:mod:`omnigent.policies.builtins.safety`).
+
+Covers:
+
+- ``ask_on_os_tools`` — ASKs approval before file/shell tool calls,
+  including Omnigent ``sys_os_*`` tools, Claude Code native tools
+  (``Bash``, ``Read``, ``Write``, ``Edit``, ``Glob``, ``Grep``),
+  and Codex native tools (same ``PreToolUse`` hook contract).
+- ``block_skills`` — factory that denies skill loading via two paths:
+  1. ``load_skill`` / ``read_skill_file`` tool calls (TOOL_CALL phase).
+  2. Slash-command skill loads (REQUEST phase, ``"/<name> <args>"``).
+- Existing policies are tested transitively via the registry tests;
+  these tests focus on the callable's decision logic.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from omnigent.policies.builtins.safety import ask_on_os_tools, block_skills
+from omnigent.policies.schema import PolicyEvent
+from tests.policies.builtins.helpers import tool_call_event as tc
+
+# ── ask_on_os_tools: Omnigent sys_os_* tools ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"],
+    ids=["read", "write", "edit", "shell"],
+)
+def test_ask_on_os_tools_asks_for_sys_os_tools(tool: str) -> None:
+    """Each ``sys_os_*`` tool triggers ASK.
+
+    If any returns ALLOW, the policy is not matching the Omnigent
+    built-in OS tool set.
+    """
+    args = {"command": "ls"} if tool == "sys_os_shell" else {"path": "/tmp/f"}
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    # Reason must name the tool so the user knows what is being asked.
+    assert tool in result["reason"]
+
+
+# ── ask_on_os_tools: Claude Code / Codex native tools ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("Bash", {"command": "rm -rf /"}, "rm -rf /"),
+        ("Read", {"path": "/etc/passwd"}, "/etc/passwd"),
+        ("Write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
+        ("Edit", {"path": "main.py"}, "main.py"),
+        # MultiEdit is what Claude Code reaches for on multi-hunk edits (the
+        # common case) and NotebookEdit is its .ipynb writer, which carries the
+        # path under ``notebook_path``. Both must ASK or most writes go
+        # un-approved under an approval policy.
+        ("MultiEdit", {"file_path": "main.py", "edits": []}, "main.py"),
+        ("NotebookEdit", {"notebook_path": "nb.ipynb"}, "nb.ipynb"),
+        ("Glob", {"pattern": "**/*.py"}, "**/*.py"),
+        ("Grep", {"pattern": "secret"}, "secret"),
+    ],
+    ids=["Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep"],
+)
+def test_ask_on_os_tools_asks_for_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """Claude Code and Codex native tools trigger ASK via the
+    ``PreToolUse`` hook contract.
+
+    If any returns ALLOW, the policy does not cover the native tool
+    name and the user won't see an approval prompt for harness-native
+    file/shell operations.
+
+    :param tool: Native tool name, e.g. ``"Bash"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason
+        preview so the user sees what the tool will do.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    # The preview should contain the relevant argument value so the
+    # user can make an informed approval decision.
+    assert expected_preview in result["reason"]
+
+
+def test_ask_on_os_tools_handles_non_string_code() -> None:
+    """A non-string ``code`` payload must still ASK, not raise.
+
+    ``None[:80]`` raises TypeError, which the engine turns into a
+    ``policy '<name>' failed`` DENY — a confusing failure instead of the
+    approval prompt the user attached the policy for.
+    """
+    result = ask_on_os_tools(tc("execute_code", {"code": None}))
+    assert result["result"] == "ASK"
+
+
+# ── ask_on_os_tools: Pi native tools (lowercase) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("bash", {"command": "rm -rf /"}, "rm -rf /"),
+        ("read", {"path": "/etc/passwd"}, "/etc/passwd"),
+        ("write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
+        ("edit", {"path": "main.py"}, "main.py"),
+    ],
+    ids=["bash", "read", "write", "edit"],
+)
+def test_ask_on_os_tools_asks_for_pi_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """Pi's lowercase native tools trigger ASK via the pi ``tool_call``
+    hook contract.
+
+    Pi names its in-process tools ``read`` / ``bash`` / ``write`` /
+    ``edit`` — distinct from the Claude/Codex casing covered above. The
+    pi executor routes these through the same TOOL_CALL verdict, so the
+    builtin must recognize the lowercase names; otherwise a polly pi
+    worker calling native ``read`` (enabled for skills) is silently
+    un-gated. If any returns ALLOW, the lowercase name isn't covered.
+
+    Asserts the preview too, proving pi's ``command`` / ``path`` arg keys
+    (which match the Omnigent convention, not Claude's ``file_path``)
+    resolve through the existing preview branches without a pi-specific
+    arg path.
+
+    :param tool: Pi native tool name, e.g. ``"bash"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    assert expected_preview in result["reason"]
+
+
+# ── ask_on_os_tools: Goose native tools (developer__ namespace) ───────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("developer__shell", {"command": "rm -rf /"}, "rm -rf /"),
+        ("developer__write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
+        ("developer__edit", {"path": "main.py"}, "main.py"),
+        ("developer__text_editor", {"path": "main.py"}, "main.py"),
+    ],
+    ids=["shell", "write", "edit", "text_editor"],
+)
+def test_ask_on_os_tools_asks_for_goose_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """Goose's ``developer__*`` tools trigger ASK via the ``PreToolUse`` hook.
+
+    Goose namespaces its built-in developer tools (``developer__shell`` etc.).
+    Without these names the standard ``ask_on_os_tools`` policy would silently
+    fail to gate a native goose session's shell/file tools — so a card would
+    never appear. ``developer__shell`` resolves the ``command`` preview branch;
+    the file tools use Goose's ``path`` arg, matching the default branch.
+
+    :param tool: Goose native tool name, e.g. ``"developer__shell"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    assert expected_preview in result["reason"]
+
+
+# ── ask_on_os_tools: opencode native permission actions ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("shell", {"command": "rm -rf /"}, "rm -rf /"),
+        ("read", {"path": "/etc/passwd"}, "/etc/passwd"),
+        ("edit", {"path": "main.py"}, "main.py"),
+        ("grep", {"pattern": "secret"}, "secret"),
+        ("glob", {"pattern": "**/*.py"}, "**/*.py"),
+    ],
+    ids=["shell", "read", "edit", "grep", "glob"],
+)
+def test_ask_on_os_tools_asks_for_opencode_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """opencode 2.x permission actions trigger ASK via the forwarder's
+    ``permission.asked`` → policy-evaluate path.
+
+    :param tool: opencode permission action, e.g. ``"shell"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    assert expected_preview in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "tool", ["webfetch", "skill", "subagent", "question", "external_directory"]
+)
+def test_ask_on_os_tools_ignores_non_file_opencode_actions(tool: str) -> None:
+    """Non file/shell opencode actions are not OS tools."""
+    assert ask_on_os_tools(tc(tool, {}))["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize("tool", ["opencode_list_mcp_resources", "opencode_read_mcp_resource"])
+def test_ask_on_os_tools_asks_for_opencode_mcp_builtins(tool: str) -> None:
+    """OpenCode's own MCP builtins reach MCP servers without a relay tool name."""
+    result = ask_on_os_tools(tc(tool, {}))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+
+
+def test_opencode_os_tool_set_is_v2_action_names() -> None:
+    from omnigent.policies.builtins.safety import _OPENCODE_NATIVE_OS_TOOLS
+
+    assert (
+        frozenset(
+            {
+                "shell",
+                "edit",
+                "read",
+                "grep",
+                "glob",
+                "opencode_list_mcp_resources",
+                "opencode_read_mcp_resource",
+            }
+        )
+        == _OPENCODE_NATIVE_OS_TOOLS
+    )
+
+
+def test_block_skills_blocks_opencode_skill_action() -> None:
+    """opencode's ``skill`` permission action carries the skill id as ``skill``."""
+    policy = block_skills(["deploy"])
+    assert policy(tc("skill", {"skill": "deploy"}))["result"] == "DENY"
+    assert policy(tc("skill", {"skill": "review"}))["result"] == "ALLOW"
+
+
+# ── ask_on_os_tools: codex in-process harness observed shell tool ─────────────
+
+
+def test_ask_on_os_tools_asks_for_codex_in_process_shell_tool() -> None:
+    """Codex in-process harness's observed ``shell`` tool triggers ASK.
+
+    The codex app-server executor surfaces ``commandExecution`` items as
+    ``ToolCallRequest(name="shell")``. Without ``"shell"`` in the OS-tool set,
+    ``ask_on_os_tools`` would silently pass every codex-harness shell command
+    without prompting — the policy would appear active (it fires on ``Bash``)
+    but be inert for the separate in-process codex lane.
+
+    A correct result means the preview also carries the command string so the
+    user can see what codex is about to run.
+    """
+    result = ask_on_os_tools(tc("shell", {"command": "rm -rf /"}))
+    assert result["result"] == "ASK"
+    assert "shell" in result["reason"]
+    assert "rm -rf /" in result["reason"]
+
+
+# ── ask_on_os_tools: Omnigent sys_terminal_* tools ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "expected_preview"),
+    [
+        ("sys_terminal_launch", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        (
+            "sys_terminal_launch",
+            {"terminal": "bash", "session": "s1", "cwd": "/repo"},
+            "bash/s1 cwd='/repo'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test"},
+            "bash/s1 text='make test' keys='Enter'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test", "keys": ""},
+            "bash/s1 text='make test' keys=''",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "keys": "C-c"},
+            "bash/s1 keys='C-c'",
+        ),
+        ("sys_terminal_read", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        ("sys_terminal_close", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+    ],
+    ids=["launch", "launch-cwd", "send-text", "send-no-keys", "send-keys", "read", "close"],
+)
+def test_ask_on_os_tools_asks_for_sys_terminal_tools(
+    tool: str, args: dict[str, str], expected_preview: str
+) -> None:
+    """Terminal tools that run, read, or stop a process trigger ASK.
+
+    ``sys_terminal_launch`` and ``sys_terminal_send`` run commands like
+    ``sys_os_shell``, so without them in the OS-tool set the policy would let
+    an agent run commands through a terminal with no approval prompt. The
+    preview names the target terminal and, for a send, the typed text and the
+    keys pressed after it (``Enter`` when omitted, as the tool does).
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert f"{tool}({expected_preview!r})" in result["reason"]
+
+
+def test_ask_on_os_tools_allows_sys_terminal_list() -> None:
+    """``sys_terminal_list`` only names terminals, so it passes through."""
+    result = ask_on_os_tools(tc("sys_terminal_list", {}))
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_os_tools_allows_non_os_tool() -> None:
+    """A tool that is not a file/shell operation passes through.
+
+    If this returns ASK, the policy is over-matching on unrelated tools.
+    """
+    result = ask_on_os_tools(tc("web_search", {"query": "hello"}))
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_os_tools_allows_non_tool_call_phase() -> None:
+    """Non-tool_call phases (e.g. ``response``) pass through.
+
+    If this returns ASK, the policy is firing on phases it shouldn't.
+    """
+    event: PolicyEvent = {
+        "type": "response",
+        "target": None,
+        "data": "I ran Bash for you.",
+        "context": {"actor": {}, "usage": {}},
+        "session_state": {},
+    }
+    result = ask_on_os_tools(event)
+    assert result["result"] == "ALLOW"
+
+
+# ── block_skills: load_skill ────────────────────────────────────────────────
+
+
+def test_block_skills_denies_blocked_load_skill() -> None:
+    """A ``load_skill`` call for a blocked skill name is denied.
+
+    If this passes when the deny branch is removed, the policy
+    is not intercepting load_skill calls.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("load_skill", {"name": "code-review"}))
+    assert result["result"] == "DENY"
+    # Reason should mention the blocked skill name so the user
+    # understands why the call was denied.
+    assert "code-review" in result["reason"]
+
+
+def test_block_skills_allows_unblocked_load_skill() -> None:
+    """A ``load_skill`` call for a skill NOT in the blocked list is allowed.
+
+    If this returns DENY, the policy is over-blocking.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("load_skill", {"name": "deploy"}))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_case_insensitive() -> None:
+    """Skill name matching is case-insensitive.
+
+    Blocked list has lowercase; tool call has mixed case.
+    If this returns ALLOW, the case normalization is broken.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("load_skill", {"name": "Code-Review"}))
+    assert result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "blocked_name,call_name",
+    [
+        ("Code-Review", "code-review"),
+        ("CODE-REVIEW", "code-review"),
+        ("deploy", "DEPLOY"),
+    ],
+    ids=["upper-blocked-lower-call", "allcaps-blocked-lower-call", "lower-blocked-upper-call"],
+)
+def test_block_skills_case_insensitive_parametrized(blocked_name: str, call_name: str) -> None:
+    """Case insensitivity works in both directions.
+
+    :param blocked_name: The name as declared in the blocked list.
+    :param call_name: The name the agent passes to ``load_skill``.
+    """
+    policy = block_skills(blocked=[blocked_name])
+    result = policy(tc("load_skill", {"name": call_name}))
+    assert result["result"] == "DENY"
+
+
+# ── block_skills: read_skill_file ───────────────────────────────────────────
+
+
+def test_block_skills_denies_blocked_read_skill_file() -> None:
+    """A ``read_skill_file`` call for a blocked skill is denied.
+
+    ``read_skill_file`` uses ``skill_name`` (not ``name``) as its
+    argument key. If this returns ALLOW, the argument key mapping
+    for read_skill_file is wrong.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("read_skill_file", {"skill_name": "code-review", "path": "foo.md"}))
+    assert result["result"] == "DENY"
+    assert "code-review" in result["reason"]
+
+
+def test_block_skills_allows_unblocked_read_skill_file() -> None:
+    """A ``read_skill_file`` call for a non-blocked skill is allowed.
+
+    If this returns DENY, the policy is over-blocking read_skill_file.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("read_skill_file", {"skill_name": "deploy", "path": "foo.md"}))
+    assert result["result"] == "ALLOW"
+
+
+# ── block_skills: non-skill tools + non-tool_call phases ────────────────────
+
+
+def test_block_skills_allows_non_skill_tools() -> None:
+    """Tool calls that are not ``load_skill`` or ``read_skill_file``
+    pass through regardless of blocked list.
+
+    If this returns DENY, the policy is intercepting unrelated tools.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("sys_os_shell", {"command": "echo hello"}))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_allows_response_phase() -> None:
+    """Non-actionable phases (e.g. ``response``) pass through.
+
+    If this returns DENY, the policy is firing on phases it shouldn't.
+    """
+    policy = block_skills(blocked=["code-review"])
+    event: PolicyEvent = {
+        "type": "response",
+        "target": None,
+        "data": "I loaded the code-review skill for you.",
+        "context": {"actor": {}, "usage": {}},
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_allows_request_without_slash() -> None:
+    """Request-phase events that are plain text (not a slash command)
+    pass through even if they mention a blocked skill name.
+
+    If this returns DENY, the policy is over-matching on request content.
+    """
+    policy = block_skills(blocked=["code-review"])
+    event: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "load the code-review skill",
+        "context": {"actor": {}, "usage": {}},
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "ALLOW"
+
+
+# ── block_skills: multiple blocked names ────────────────────────────────────
+
+
+def test_block_skills_multiple_blocked_names() -> None:
+    """Multiple skill names can be blocked simultaneously.
+
+    If only the first name is blocked, the frozenset construction
+    is broken.
+    """
+    policy = block_skills(blocked=["code-review", "deploy", "admin"])
+    # All three blocked
+    assert policy(tc("load_skill", {"name": "code-review"}))["result"] == "DENY"
+    assert policy(tc("load_skill", {"name": "deploy"}))["result"] == "DENY"
+    assert policy(tc("load_skill", {"name": "admin"}))["result"] == "DENY"
+    # Not blocked
+    assert policy(tc("load_skill", {"name": "safe-skill"}))["result"] == "ALLOW"
+
+
+# ── block_skills: edge cases ────────────────────────────────────────────────
+
+
+def test_block_skills_empty_blocked_list_allows_all() -> None:
+    """An empty blocked list allows all skill loads.
+
+    If this returns DENY, the empty-set handling is wrong.
+    """
+    policy = block_skills(blocked=[])
+    result = policy(tc("load_skill", {"name": "anything"}))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_missing_name_argument_allows() -> None:
+    """A ``load_skill`` call with no ``name`` argument is allowed.
+
+    Malformed calls should not crash the policy; they should pass
+    through so the tool itself can report the validation error.
+    """
+    policy = block_skills(blocked=["code-review"])
+    result = policy(tc("load_skill", {}))
+    assert result["result"] == "ALLOW"
+
+
+# ── block_skills: slash-command path (REQUEST phase) ────────────────────────
+
+
+def _request_event(text: str) -> PolicyEvent:
+    """Build a ``request`` :class:`PolicyEvent` with the given text.
+
+    The Omnigent server evaluates skill slash commands at the REQUEST phase
+    as synthetic ``"/<name> <args>"`` strings via
+    ``_build_skill_slash_command_policy_body``.
+
+    :param text: User input text, e.g. ``"/git-stack create foo"``.
+    :returns: A ``request`` event dict.
+    """
+    return {
+        "type": "request",
+        "target": None,
+        "data": text,
+        "context": {"actor": {}, "usage": {}},
+        "session_state": {},
+    }
+
+
+def test_block_skills_denies_slash_command_blocked_skill() -> None:
+    """A ``/blocked-skill`` slash command is denied at the request phase.
+
+    This is the path the Omnigent server takes when the user types
+    ``/skill-name`` in the UI — it converts to a synthetic request
+    with text ``"/skill-name"``. If this returns ALLOW, the slash
+    command bypass is not covered.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event("/git-stack"))
+    assert result["result"] == "DENY"
+    assert "git-stack" in result["reason"]
+
+
+def test_block_skills_denies_slash_command_with_arguments() -> None:
+    """A ``/blocked-skill args`` slash command is denied.
+
+    The command name is the first token after ``/``.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event("/git-stack create my-feature"))
+    assert result["result"] == "DENY"
+    assert "git-stack" in result["reason"]
+
+
+def test_block_skills_allows_slash_command_unblocked_skill() -> None:
+    """A ``/safe-skill`` slash command passes through.
+
+    If this returns DENY, the policy is over-blocking slash commands.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event("/deploy"))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_slash_command_case_insensitive() -> None:
+    """Slash-command matching is case-insensitive.
+
+    The user might type ``/Git-Stack`` but the blocked list has
+    ``git-stack``.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event("/Git-Stack"))
+    assert result["result"] == "DENY"
+
+
+def test_block_skills_slash_command_bare_slash_allows() -> None:
+    """A bare ``/`` with no command name passes through.
+
+    Edge case: should not crash or over-match.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event("/"))
+    assert result["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize("text", ["/ ", "/   ", "/\t"])
+def test_block_skills_slash_then_whitespace_allows(text: str) -> None:
+    """A slash followed only by whitespace passes through without crashing.
+
+    ``split(None, ...)`` drops empty tokens, so ``"/ ".split()`` is an
+    empty list. The command extraction must not index ``[0]`` blindly,
+    or evaluation raises ``IndexError`` and the request fails closed.
+    """
+    policy = block_skills(blocked=["git-stack"])
+    result = policy(_request_event(text))
+    assert result["result"] == "ALLOW"
+
+
+# ── ask_on_add_policy ──────────────────────────────────────────
+
+
+def test_ask_on_add_policy_asks_for_sys_add_policy() -> None:
+    """sys_add_policy tool call triggers ASK with a preview."""
+    from omnigent.policies.builtins.safety import ask_on_add_policy
+
+    result = ask_on_add_policy(
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "sys_add_policy",
+                "arguments": {
+                    "name": "block_shell",
+                    "handler": "omnigent.policies.builtins.cel.cel_policy",
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert "block_shell" in result["reason"]
+    assert "cel_policy" in result["reason"]
+
+
+def test_ask_on_add_policy_allows_other_tools() -> None:
+    """Non-policy tool calls pass through."""
+    from omnigent.policies.builtins.safety import ask_on_add_policy
+
+    result = ask_on_add_policy(
+        {
+            "type": "tool_call",
+            "data": {"name": "web_search", "arguments": {}},
+        }
+    )
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_add_policy_allows_non_tool_events() -> None:
+    """Non-tool_call events pass through."""
+    from omnigent.policies.builtins.safety import ask_on_add_policy
+
+    result = ask_on_add_policy({"type": "request", "data": "hello"})
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_add_policy_handles_missing_arguments() -> None:
+    """Missing or non-dict arguments doesn't crash."""
+    from omnigent.policies.builtins.safety import ask_on_add_policy
+
+    result = ask_on_add_policy(
+        {
+            "type": "tool_call",
+            "data": {"name": "sys_add_policy"},
+        }
+    )
+    assert result["result"] == "ASK"
+
+
+# ── ask_on_scheduled_task_change ───────────────────────────────
+
+
+@pytest.mark.parametrize("data_name", ["sys_scheduled_task_create", "transformed_tool"])
+def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: str) -> None:
+    """A create call ASKs and names the task and its schedule."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "name": data_name,
+                "arguments": {
+                    "name": "nightly triage",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert "nightly triage" in result["reason"]
+    assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
+    assert "Effective task permission mode: agent default (no task override)" in result["reason"]
+
+
+def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
+    """Launch settings and every prompt character remain in the approval reason."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    prompt = "Summarize everything. " * 300
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "name": "sys_scheduled_task_create",
+                "arguments": {
+                    "name": "nightly triage",
+                    "prompt": prompt,
+                    "rrule": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0",
+                    "timezone": "America/Los_Angeles",
+                    "agent_id": "ag_" + "a" * 70,
+                    "host_id": "host_" + "b" * 70,
+                    "workspace": "/srv/" + "c" * 70,
+                    "model_override": "databricks-" + "d" * 70,
+                    "execution_target": "managed_sandbox",
+                    "project_name": "Nightly triage",
+                    "permission_mode": "bypassPermissions",
+                    "max_cost_usd": 2.5,
+                },
+            },
+        }
+    )
+    reason = result["reason"]
+    assert result["result"] == "ASK"
+    for setting in (
+        "agent_id=ag_" + "a" * 54 + "...",
+        "rrule=FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0",
+        "timezone=America/Los_Angeles",
+        "host_id=host_" + "b" * 52 + "...",
+        "workspace=/srv/",
+        "execution_target=managed_sandbox",
+        "project_name=Nightly triage",
+        "permission_mode=bypassPermissions",
+        "max_cost_usd=2.5",
+    ):
+        assert setting in reason, reason
+    assert prompt in reason
+    assert "Effective task permission mode: bypassPermissions" in reason
+
+
+@pytest.mark.parametrize(
+    "extras,expected",
+    [
+        (
+            {f"setting_{i:02d}": "v" * 80 for i in range(20)},
+            ", ".join(f"setting_{i:02d}=" + "v" * 57 + "..." for i in range(2)) + ", ...",
+        ),
+        ({"x" * 250: "value"}, "..."),
+        ({"x" * 150: "first, " + "v" * 70}, "..."),
+        ({"x" * 190: "a, b"}, "x" * 190 + "=a, b"),
+    ],
+    ids=["many-extras", "long-key", "comma-within-clipped-pair", "complete-comma-value"],
+)
+def test_ask_on_scheduled_task_change_bounds_the_preview(
+    extras: dict[str, object], expected: str
+) -> None:
+    """Many long extra arguments and a long name still give a short, readable reason."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    arguments = dict(extras)
+    arguments["name"] = "N" * 100
+    arguments["timezone"] = "UTC"
+    arguments["prompt"] = "Run the review."
+    arguments["permission_mode"] = None
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {"name": "sys_scheduled_task_create", "arguments": arguments},
+        }
+    )
+    reason = result["reason"]
+    assert result["result"] == "ASK"
+    assert "'" + "N" * 57 + "...'" in reason
+    assert reason.count("v" * 58) == 0
+    assert "Settings: name=" in reason
+    assert f"timezone=UTC, permission_mode=None, {expected}" in reason
+    settings = reason.split("Settings: ", 1)[1].split("\nFull automation instructions:", 1)[0]
+    # These known fields use at most 102 characters; extras have a 200-character budget.
+    assert len(settings) <= 302
+
+
+def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
+    """A create without a name or an update without an id still gets a readable preview."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    create = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "name": "sys_scheduled_task_create",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=HOURLY",
+                },
+            },
+        }
+    )
+    update = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "state": "paused",
+                },
+            },
+        }
+    )
+    assert "scheduled task '(unnamed)'" in create["reason"]
+    assert update["result"] == "DENY"
+    assert "scheduled_task_id" in update["reason"]
+
+
+def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
+    """An update call ASKs and names the task id and the fields it changes."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": "auto",
+                    "state": "paused",
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert "0123456789abcdef0123456789abcdef" in result["reason"]
+    assert "state=paused" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "tool", ["sys_scheduled_task_list", "sys_scheduled_task_delete", "web_search"]
+)
+def test_ask_on_scheduled_task_change_allows_other_tools(tool: str) -> None:
+    """Reads, deletes and unrelated tools pass through."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {"type": "tool_call", "target": tool, "data": {"name": tool, "arguments": {}}}
+    )
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_scheduled_task_change_allows_non_tool_events() -> None:
+    """Non-tool_call events pass through."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change({"type": "request", "data": "hello"})
+    assert result["result"] == "ALLOW"
+
+
+def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
+    """Missing or non-dict review arguments fail closed."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {"name": "sys_scheduled_task_update", "arguments": "not-a-dict"},
+        }
+    )
+    assert result["result"] == "DENY"
+    assert "scheduled_task_id" in result["reason"]
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("prompt", value) for value in [None, "", " \n\t", 1, ["instructions"]]]
+    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"]]],
+)
+def test_scheduled_task_approval_denies_invalid_review_values(
+    action: str, field: str, value: object
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Review every issue.",
+                    "permission_mode": None,
+                    field: value,
+                }
+            },
+        }
+    )
+    assert result["result"] == "DENY"
+    assert f"{field} must be a non-empty string" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("action", "missing_field", "agent_id"),
+    [
+        ("create", "prompt", None),
+        ("create", "permission_mode", None),
+        ("update", "prompt", None),
+        ("update", "permission_mode", None),
+        ("update", "permission_mode", "another-agent"),
+    ],
+)
+def test_legacy_scheduled_task_approval_identifies_omitted_fields(
+    action: str, missing_field: str, agent_id: str | None
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    arguments = {
+        "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+        "prompt": "Review every issue.",
+        "permission_mode": "auto",
+    }
+    arguments.pop(missing_field)
+    if agent_id is not None:
+        arguments["agent_id"] = agent_id
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {"arguments": arguments},
+        }
+    )
+    if action == "create" and missing_field == "prompt":
+        assert result["result"] == "DENY"
+    else:
+        assert result["result"] == "ASK"
+        if missing_field == "prompt":
+            expected_prompt = "(unchanged; not supplied by legacy caller)"
+            expected_permission = "auto"
+        else:
+            expected_prompt = "Review every issue."
+            if action == "create":
+                expected_permission = "agent default (no task override)"
+            elif agent_id is not None:
+                expected_permission = (
+                    "existing override retained if agent_id is unchanged; "
+                    "cleared to agent default (no task override) if agent_id changes "
+                    "(not supplied by legacy caller)"
+                )
+            else:
+                expected_permission = "unchanged (not supplied by legacy caller)"
+        assert (
+            f"Effective task permission mode: {expected_permission}"
+            in result["reason"].splitlines()
+        )
+        assert result["reason"].endswith(
+            f"Full automation instructions:\n{expected_prompt}\nApprove?"
+        )
+        if action == "update":
+            assert "Legacy partial update" in result["reason"]
+            assert "unchanged values were not supplied" not in result["reason"]
+
+
+# ── block_skills: native Skill tool (PreToolUse hook path) ─────────────────
+
+
+def test_block_skills_denies_native_skill_tool() -> None:
+    """The native ``Skill`` tool call for a blocked skill is denied.
+
+    This is the primary enforcement path for native Claude Code and Codex
+    harnesses, where there is no ``load_skill`` runner tool. The
+    ``PreToolUse`` hook fires → Omnigent server evaluates → this policy denies.
+    If this returns ALLOW, native harnesses can load blocked skills.
+    """
+    policy = block_skills(blocked=["deploy"])
+    result = policy(tc("Skill", {"skill": "deploy"}))
+    assert result["result"] == "DENY"
+    assert "deploy" in result["reason"]
+
+
+def test_block_skills_allows_unblocked_native_skill_tool() -> None:
+    """A native ``Skill`` call for a skill NOT in the blocked list is allowed.
+
+    If this returns DENY, the policy is over-blocking native skill calls.
+    """
+    policy = block_skills(blocked=["deploy"])
+    result = policy(tc("Skill", {"skill": "review"}))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_native_skill_tool_case_insensitive() -> None:
+    """Native ``Skill`` tool matching is case-insensitive.
+
+    The blocked list has lowercase; the tool call has mixed case.
+    If this returns ALLOW, the case normalization is broken for
+    the native tool path.
+    """
+    policy = block_skills(blocked=["deploy"])
+    result = policy(tc("Skill", {"skill": "Deploy"}))
+    assert result["result"] == "DENY"
+
+
+def test_block_skills_native_skill_tool_missing_skill_arg_allows() -> None:
+    """A ``Skill`` call with no ``skill`` argument passes through gracefully.
+
+    Edge case: should not crash or over-match when the argument is absent.
+    """
+    policy = block_skills(blocked=["deploy"])
+    result = policy(tc("Skill", {}))
+    assert result["result"] == "ALLOW"
+
+
+def test_block_skills_native_skill_tool_with_args() -> None:
+    """A ``Skill`` call with extra ``args`` is still checked correctly.
+
+    The ``skill`` argument is what matters; ``args`` is the optional
+    skill argument string and should not affect matching.
+    """
+    policy = block_skills(blocked=["deploy"])
+    result = policy(tc("Skill", {"skill": "deploy", "args": "--force"}))
+    assert result["result"] == "DENY"
+
+
+# ── block_skills: namespace aliases ──────────────────────────────────────
+
+
+def test_block_skills_denies_namespaced_alias_of_blocked_bare_name() -> None:
+    """Blocking the bare name also blocks its ``plugin:skill`` spelling.
+
+    The skill resolver accepts ``plugin:skill`` as an alias for the bare
+    skill, so allowing the namespaced spelling through would bypass the
+    blocklist entirely.
+    """
+    policy = block_skills(blocked=["deploy"])
+    assert policy(tc("load_skill", {"name": "myplugin:deploy"}))["result"] == "DENY"
+    assert policy(tc("Skill", {"skill": "myplugin:deploy"}))["result"] == "DENY"
+    assert policy(_request_event("/myplugin:deploy now"))["result"] == "DENY"
+
+
+def test_block_skills_denies_bare_alias_of_blocked_namespaced_name() -> None:
+    """Blocking ``plugin:skill`` also blocks the bare ``skill`` spelling.
+
+    On codex-family surfaces the blocked plugin skill is exposed under
+    exactly the bare name, so allowing it through would bypass the block.
+    """
+    policy = block_skills(blocked=["myplugin:deploy"])
+    assert policy(tc("load_skill", {"name": "deploy"}))["result"] == "DENY"
+    assert policy(_request_event("/deploy"))["result"] == "DENY"
+
+
+def test_block_skills_alias_matching_does_not_over_block() -> None:
+    """Alias-aware matching still allows genuinely different skills.
+
+    A namespaced block entry must not deny a *different* exact namespace:
+    ``otherplugin:deploy`` is a distinct skill from ``myplugin:deploy``.
+    """
+    policy = block_skills(blocked=["myplugin:deploy"])
+    assert policy(tc("load_skill", {"name": "deployer"}))["result"] == "ALLOW"
+    assert policy(tc("load_skill", {"name": "myplugin:other"}))["result"] == "ALLOW"
+    assert policy(tc("load_skill", {"name": "otherplugin:deploy"}))["result"] == "ALLOW"

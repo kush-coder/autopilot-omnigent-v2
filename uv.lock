@@ -1041,7 +1041,7 @@ wheels = [
 
 [[package]]
 name = "databricks-ai-bridge"
-version = "0.21.0"
+version = "0.22.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "databricks-ai-search" },
@@ -1053,9 +1053,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/4c/f5762c00b560dcd51fe694cce254b720cf3025b1652ee8091ac8be58cfc3/databricks_ai_bridge-0.21.0.tar.gz", hash = "sha256:76eefc44b13b898da717bcfc2e7825ac7dc1b875211c8eec9eea9ae98f090b90", size = 60340, upload-time = "2026-06-25T21:47:58.831Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/1f/67fabe6d9a702bd367fc403a7ecacecda63af4544247a55a5dc9b94ffcc9/databricks_ai_bridge-0.22.0.tar.gz", hash = "sha256:01459ffb543ce9f33dff2da7a5539aae1f9a0f054f81218a2a1c9384ea921f91", size = 60683, upload-time = "2026-09-18T21:31:28.652Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/69/a4/9e2ac91c180f72555e5436a3f45f73cc606d84d5ba8744213f6addc68a58/databricks_ai_bridge-0.21.0-py3-none-any.whl", hash = "sha256:5426c88c93be3765d00ad4581eff31b404a0c8154f9f25fb2fcc456170247290", size = 69621, upload-time = "2026-06-25T21:47:57.601Z" },
+    { url = "https://files.pythonhosted.org/packages/64/7b/cd49907c621bac57fc8570c00289692eff11a2e040366b0eb61938be55e9/databricks_ai_bridge-0.22.0-py3-none-any.whl", hash = "sha256:68bf3ccfad144eab772f50ccf2e4035f4227589bf515d650fab13ac028225aa0", size = 70060, upload-time = "2026-09-18T21:31:27.591Z" },
 ]
 
 [[package]]
